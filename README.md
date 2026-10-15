@@ -1,6 +1,9 @@
 # ArtCraft Android Builder
 
+## Go to releases if you just want to download the ports
+
 Builds locally signed, arm64 Android ports of ArtCraft apps from official Storytold app repositories
+
 
 ## Usage
 
