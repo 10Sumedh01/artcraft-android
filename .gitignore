@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+output/
+logs/
+keys/
+.cargo-home/
+
+# Source checkouts (cloned during build)
+source/
+
+# Backups
+backups/
+
+# OS files
+.DS_Store
+Thumbs.db

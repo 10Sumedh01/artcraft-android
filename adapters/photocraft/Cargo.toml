@@ -1,0 +1,55 @@
+[package]
+name = "photocraft-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+photocraft-engine = { path = "../../crates/engine" }
+photocraft-ui-egui = { path = "../../crates/ui-egui" }
+photocraft-io = { path = "../../crates/io" }
+photocraft-doc = { path = "../../crates/doc" }
+photocraft-codecs = { path = "../../crates/codecs" }
+eframe = { workspace = true, features = ["wgpu", "persistence"] }
+egui = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+jni = "0.22"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", default-features = false, features = ["native-activity"] }
+
+[package.metadata.android]
+package = "ai.storyteller.photocraft"
+apk_name = "photocraft"
+build_targets = ["aarch64-linux-android"]
+resources = "res"
+java_sources = "java"
+
+[package.metadata.android.sdk]
+min_sdk_version = 28
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "PhotoCraft"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+icon = "@drawable/ic_launcher"
+
+[[package.metadata.android.application.activity]]
+name = ".PhotoCraftActivity"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|layoutDirection"
+label = "PhotoCraft"
+launch_mode = "singleTask"
+orientation = "sensor"
+exported = true
+# cargo-apk2 does NOT add a default MAIN/LAUNCHER filter when an activity is named, so declare it
+# here: without it the APK has no launcher activity and cannot be started from the home screen.
+# Keep it inline: cargo-apk2's serde `flatten` rejects an `[[...activity.intent_filter]]` table.
+intent_filter = [{ actions = ["android.intent.action.MAIN"], categories = ["android.intent.category.LAUNCHER"] }]
+
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "photocraft_android"

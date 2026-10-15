@@ -50,6 +50,3 @@ clipboard, lifecycle and touch workflows separately before treating it as a comp
 
 The keystore in `keys/` is for local builds only, with a randomly generated local password stored in `keys/.keystore-password`. Keep it safe and stable
 if you need to install updates over an earlier APK from this builder. Do not use it for a public release.
-# artcraft-android
-# artcraft-android
-# artcraft-android
