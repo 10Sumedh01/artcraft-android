@@ -226,7 +226,9 @@ fi
 [[ -n "$NDK" && -d "$NDK" ]] || fail "No Android NDK found. Install one using Android SDK Manager."
 export ANDROID_HOME="$SDK" ANDROID_SDK_ROOT="$SDK"
 export ANDROID_NDK_HOME="$NDK" ANDROID_NDK_ROOT="$NDK" NDK_HOME="$NDK"
-export PATH="$SDK/platform-tools:$SDK/build-tools/$BUILD_TOOLS:$PATH"
+NDK_TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+[[ -d "$NDK_TOOLCHAIN" ]] || NDK_TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+export PATH="$NDK_TOOLCHAIN:$SDK/platform-tools:$SDK/build-tools/$BUILD_TOOLS:$PATH"
 echo "SDK: $SDK"
 echo "Platform: android-$TARGET_SDK"
 echo "Build Tools: $BUILD_TOOLS"
@@ -255,11 +257,11 @@ if [[ -x "adapters/$APP/prepare.sh" ]]; then
     echo "Using app-specific adapter: adapters/$APP/prepare.sh"
     bash "adapters/$APP/prepare.sh" "$APP" "$TITLE" "$SRC" "$MODE"
 else
-    python3 - "$ROOT" "$SRC" "$APP" "$TITLE" "$TARGET_SDK" <<'PY'
+    python3 - "$ROOT" "$SRC" "$APP" "$TITLE" "$TARGET_SDK" "$APPNAME" "$PACKAGENAME" "$APPICON" <<'PY'
 from pathlib import Path
 import re, shutil, sys, tomllib
 
-root, src_s, app, title, target_sdk = sys.argv[1:]
+root, src_s, app, title, target_sdk, appname, packagename, appicon = sys.argv[1:]
 root, src = Path(root), Path(src_s)
 android_dir = src / "apps" / f"{app}-android"
 marker = android_dir / ".artcraft-android-builder-generated"
@@ -1423,10 +1425,10 @@ if not re.search(r"\bServices\b|\bNoServices\b", construct) and "Services" not i
 
 # Prefer the app's own icon; don't accidentally bundle another ArtCraft app's branding.
 # An explicit -appicon always wins.
-if APPICON:
-    icon = Path(APPICON)
+if appicon:
+    icon = Path(appicon)
     if not icon.is_file():
-        raise SystemExit(f"App icon not found: {APPICON}")
+        raise SystemExit(f"App icon not found: {appicon}")
 else:
     icon_candidates = [
         src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"ai.storyteller.{app}.png",
@@ -1505,7 +1507,7 @@ orientation = "sensor"
 exported = true
 '''
 
-    package_name = PACKAGENAME if PACKAGENAME else f"ai.storyteller.{app}"
+    package_name = packagename if packagename else f"ai.storyteller.{app}"
     # Read the app's version from the source workspace manifest so the APK is named photocraft-0.8.0.apk.
     try:
         app_version = ws["workspace"]["package"]["version"]
@@ -1565,7 +1567,7 @@ icon = "@mipmap/ic_launcher"
     (staging_dir / "Cargo.toml").write_text(manifest)
 
     if saf:
-        pkg = PACKAGENAME if PACKAGENAME else f"ai.storyteller.{app}"
+        pkg = packagename if packagename else f"ai.storyteller.{app}"
         java_src = (root / "templates" / "android" / "SafActivity.java").read_text()
         java_src = (
             java_src.replace("__PACKAGE__", pkg)

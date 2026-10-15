@@ -170,7 +170,7 @@ fn android_clipboard_get_text() -> Option<String> {
     let res = vm.attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
         let ctx_raw: jni::sys::jobject = ctx.context().cast();
         // SAFETY: the context is an Android global ref owned by ndk-context; borrow, never delete.
-        let context = unsafe { env.as_cast_raw::<JObject>(&ctx_raw)? };
+        let context = unsafe { env.as_cast_raw::<JObject<'_>>(&ctx_raw)? };
         let service_obj = JObject::from(env.new_string("clipboard")?);
         let clipboard = env
             .call_method(
@@ -260,7 +260,7 @@ fn android_clipboard_set_text(text: &str) -> bool {
     let res = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
         let ctx_raw: jni::sys::jobject = ctx.context().cast();
         // SAFETY: the context is an Android global ref owned by ndk-context; borrow, never delete.
-        let context = unsafe { env.as_cast_raw::<JObject>(&ctx_raw)? };
+        let context = unsafe { env.as_cast_raw::<JObject<'_>>(&ctx_raw)? };
         let service_obj = JObject::from(env.new_string("clipboard")?);
         let clipboard = env
             .call_method(
