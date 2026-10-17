@@ -455,6 +455,8 @@ public final class PhotoCraftActivity extends NativeActivity {
      * <p>A document that is opened again reuses its staged file; a different document whose name is
      * already taken gets a {@code " (2)"}-style suffix, because the staged path is the key that maps
      * back to the picked document and two documents sharing one path would overwrite each other.
+     * A name whose staged copy has since been deleted (the app prunes working copies the recent list
+     * let go of) is free again: the stale {@code uri:} mapping is harmless.
      */
     private File newStageFile(String name, Uri uri) throws Exception {
         File dir = new File(appStorageDir(), "media");
@@ -469,7 +471,7 @@ public final class PhotoCraftActivity extends NativeActivity {
             String candidate = attempt == 1 ? safe : stem + " (" + attempt + ")" + extension;
             File file = new File(dir, candidate);
             String mapped = prefs.getString("uri:" + file.getAbsolutePath(), null);
-            if (mapped == null || mapped.equals(owner)) return file;
+            if (mapped == null || mapped.equals(owner) || !file.exists()) return file;
         }
         throw new Exception("Could not find a free name for the selected document in " + dir);
     }

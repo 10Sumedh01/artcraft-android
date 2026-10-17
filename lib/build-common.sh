@@ -332,7 +332,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "23"
+GENERATOR_VERSION = "24"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -1323,6 +1323,10 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> 
     },
     "cadcraft": {
         "activity": "CadCraftActivity",
+        # Staged working copies under media/: drop one when the app lets go of it and no view is
+        # showing the drawing.
+        "recent_paths": "self.inner.ui.recent_files.clone()",
+        "open_paths": "self.inner.session.docs.iter().filter_map(|d| d.path.clone()).collect::<Vec<_>>()",
         "imports": SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": '''
@@ -1366,6 +1370,10 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> 
     # per-frame poll delivers the system picker's answer.
     "pdfcraft": {
         "activity": "PdfCraftActivity",
+        # Staged working copies under media/: drop one when the app lets go of it (Clear Recent, a
+        # per-entry ×, or the capped list aging it out) and no tab is showing the document.
+        "recent_paths": "self.inner.recent.iter().map(|r| r.path.clone()).collect::<Vec<_>>()",
+        "open_paths": "self.inner.views.iter().filter_map(|v| self.inner.session.get(v.id).and_then(|d| d.path.clone())).collect::<Vec<_>>()",
         "imports": SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": "",
@@ -1779,6 +1787,81 @@ PERSIST_ON_EXIT = '''
     }
 '''
 
+# Prune the staged working copies under `media/` (see SafActivity.newStageFile) once the app no
+# longer refers to them. The copy is a cache of a document whose original lives at its SAF
+# location, so deleting it loses nothing while keeping `Android/data/<pkg>/files` small — which is
+# the whole point of the directory being user-visible. `__RECENT__`/`__OPEN__` are filled in per
+# app: expressions yielding the current recent-file paths and the paths of open documents.
+STAGED_SWEEP_METHODS = r'''
+    /// The staged copy of a document, if `path` names one: a *direct* child of the app's own
+    /// `media/` directory. Anything else on the device is never touched.
+    fn staged_media_file(bridge: &saf::Bridge, path: &str) -> Option<std::path::PathBuf> {
+        let files = bridge.files_dir().ok()?;
+        let media = files.join("media");
+        let file = std::path::PathBuf::from(path);
+        (file.parent() == Some(media.as_path())).then_some(file)
+    }
+
+    /// Delete every staged copy under `media/` that neither the recent list nor an open document
+    /// refers to, sparing files written in the last minute (a document may be mid-import). This
+    /// clears out copies orphaned before this pruning existed, or by an app killed mid-session.
+    fn staged_sweep_orphans(bridge: &saf::Bridge, recent: &[String], open: &[String]) {
+        let Ok(files) = bridge.files_dir() else { return };
+        let media = files.join("media");
+        let Ok(entries) = std::fs::read_dir(&media) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if recent.iter().any(|keep| std::path::Path::new(keep) == path.as_path())
+                || open.iter().any(|keep| std::path::Path::new(keep) == path.as_path())
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let fresh = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_secs(60));
+            if fresh {
+                continue;
+            }
+            let name = path.to_string_lossy().into_owned();
+            match std::fs::remove_file(&path) {
+                Ok(()) => log::info!("deleted an orphaned staged copy: {name}"),
+                Err(error) => log::warn!("could not delete the staged copy {name}: {error}"),
+            }
+        }
+    }
+
+    /// When an entry leaves the recent-files list (the list is cleared, an entry is removed with
+    /// its ×, or it ages out of the capped list) and no open document is showing that file, its
+    /// staged copy under `media/` is deleted: the document's original still lives at its SAF
+    /// location. The `uri:` mapping in SharedPreferences is deliberately kept, so re-opening the
+    /// same document reuses the same path and a later save still reaches the original. A delayed
+    /// sweep of the whole directory clears out copies this diff never saw (an older session, or a
+    /// crash); it runs once, half a minute after start, to let session restore finish first.
+    fn staged_prune_tick(&mut self) {
+        let current: Vec<String> = __RECENT__;
+        let open: Vec<String> = __OPEN__;
+        for stale in self.staged_seen.iter().filter(|path| !current.contains(*path) && !open.contains(*path)) {
+            let Some(file) = Self::staged_media_file(&self.saf_bridge, stale) else { continue };
+            match std::fs::remove_file(&file) {
+                Ok(()) => log::info!("deleted the staged copy of a recent file the app let go: {stale}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => log::warn!("could not delete the staged copy {stale}: {error}"),
+            }
+        }
+        if self.staged_sweep_at.is_some_and(|at| std::time::Instant::now() >= at) {
+            self.staged_sweep_at = None;
+            Self::staged_sweep_orphans(&self.saf_bridge, &current, &open);
+        }
+        self.staged_seen = current;
+    }
+'''
+
 _persist = PERSIST_RECIPES.get(app)
 if _persist:
     _load = _persist["load"].replace("@UI@", ui_ident).replace("@ENGINE@", engine_ident)
@@ -1810,6 +1893,19 @@ else:
     persist_hook = ""
     persist_on_exit = ""
     persist_env_call = ""
+# Staged-copy pruning (see STAGED_SWEEP_METHODS): only for apps whose recipe spells out how to
+# read their recent list and open documents; the others keep whatever is under `media/`.
+_staged = (saf or {}).get("recent_paths")
+if _staged:
+    staged_fields = "\n    staged_seen: Vec<String>,\n    staged_sweep_at: Option<std::time::Instant>,"
+    staged_new_init = ", staged_seen: Vec::new(), staged_sweep_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(30))"
+    staged_methods = STAGED_SWEEP_METHODS.replace("__RECENT__", _staged).replace("__OPEN__", (saf or {}).get("open_paths") or "Vec::new()")
+    staged_logic = "        self.staged_prune_tick();\n"
+else:
+    staged_fields = ""
+    staged_new_init = ""
+    staged_methods = ""
+    staged_logic = ""
 # A type that does not implement `eframe::App` is an inner app state; its desktop `main.rs` wraps it
 # in a tiny struct that forwards `logic`/`ui`. Emit the same wrapper here.
 has_eframe_app = bool(re.search(r"impl\s+eframe::App\s+for\s+" + re.escape(app_type) + r"\b", ui_text))
@@ -2418,15 +2514,15 @@ struct AndroidShell {{
     ime: ime_bridge::ime::ImeBridge,
     modifiers: egui::Modifiers,
     fullscreen_applied: bool,
-    probe: InputProbe,{saf_fields}{intent_field}{persist_fields}
+    probe: InputProbe,{saf_fields}{intent_field}{persist_fields}{staged_fields}
 }}
 
 impl AndroidShell {{
     fn new(mut inner: {app_type}, app: AndroidApp{saf_new_params}) -> Self {{
         {persist_new_body}let ime = ime_bridge::ime::ImeBridge::new(&app);
-        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(){saf_new_init}{intent_init}{persist_new_init} }}
+        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(){saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
     }}
-{saf_poll_method}{intent_method}{persist_methods}
+{saf_poll_method}{intent_method}{persist_methods}{staged_methods}
     /// Re-apply sticky immersive mode on the first frame and whenever the window regains focus
     /// (the system restores the bars after a gesture or when another activity closes).
     fn refresh_fullscreen(&mut self, raw: &egui::RawInput) {{
@@ -2471,7 +2567,7 @@ impl AndroidShell {{
 
 impl eframe::App for AndroidShell {{
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {{
-{intent_logic}{saf_logic_poll}{persist_logic}        {inner_logic}
+{intent_logic}{saf_logic_poll}{persist_logic}{staged_logic}        {inner_logic}
     }}
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {{

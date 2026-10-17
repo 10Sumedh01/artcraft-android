@@ -1,5 +1,32 @@
 # Changelog
 
+## v24 — 2026-10-17
+
+### Changed
+- Clearing the recent-files list now removes the document's staged working copy as well. Importing
+  a PDF (or any file) through Storage Access Framework copies it to
+  `/storage/emulated/0/Android/data/com.artcraft.<app>/files/media/<document name>`, and it used to
+  stay there forever after the app forgot it. The shell now keeps a snapshot of the recent list each
+  frame: when an entry leaves it — Clear Recent, the × on one entry, or the capped list aging it
+  out — and no open document is showing that file, the staged copy under `media/` is deleted. Only
+  direct children of the app's own `media/` directory are ever touched, so nothing else on the
+  device can be lost. The `uri:` mapping in SharedPreferences is deliberately kept: re-opening the
+  same document reuses the same path (the SAF original is recopied) and a save still reaches the
+  document the user picked. The staged copy is a cache — the original lives at its SAF location —
+  so nothing but the cache is ever lost.
+- A one-time sweep, half a minute after start, deletes staged copies no longer referred to by
+  anything: leftovers from before this change, or from an app Android killed mid-session. It waits
+  for session restore, spares files written in the last minute (a document may be mid-import),
+  skips files the recent list or an open document still names, and — like the per-entry pruning —
+  only ever deletes direct children of `media/`.
+- A name whose staged copy was deleted is free again: `newStageFile` reuses the path instead of
+  adding a ` (2)` suffix when the previously mapped file no longer exists, so a cleared document
+  that is imported again lands on its original, suffix-free path. A different, still-existing file
+  with the same name keeps the suffix as before.
+- Enabled for pdfCraft, PhotoCraft and VectorCraft, and for CadCraft's next build; the remaining
+  generated apps switch it on one by one as their recent-list recipes are added (an app without a
+  recipe simply keeps everything under `media/`, the old behaviour).
+
 ## v23 — 2026-10-17
 
 ### Changed

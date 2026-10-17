@@ -554,7 +554,9 @@ public final class __CLASS__ extends NativeActivity {
      * <p>A document that is opened again reuses its staged file. A different document whose name is
      * already taken gets a {@code " (2)"}-style suffix, because the staged path is also the key that
      * maps back to the document the user picked: two documents sharing one path would overwrite each
-     * other on save.
+     * other on save. A name whose staged copy has since been deleted (the app prunes working copies
+     * the recent list let go of) is free again: the stale {@code uri:} mapping is harmless, and
+     * keeping the path rather than suffixing it is what lets a cleared document come back clean.
      */
     private File newStageFile(String name, Uri uri) throws Exception {
         File dir = new File(appStorageDir(), "media");
@@ -569,7 +571,7 @@ public final class __CLASS__ extends NativeActivity {
             String candidate = attempt == 1 ? safe : stem + " (" + attempt + ")" + extension;
             File file = new File(dir, candidate);
             String mapped = prefs.getString("uri:" + file.getAbsolutePath(), null);
-            if (mapped == null || mapped.equals(owner)) return file;
+            if (mapped == null || mapped.equals(owner) || !file.exists()) return file;
         }
         throw new Exception("Could not find a free name for the selected document in " + dir);
     }

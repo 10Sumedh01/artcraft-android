@@ -533,6 +533,10 @@ struct PhotoCraftAndroidApp {
     // finished its own start-up, and goes negative (stop polling) if the host has no intent bridge.
     intent_inbox: Inbox,
     intent_warmup: i64,
+    // Staged working copies under media/ the app still refers to (see `staged_prune_tick`), and
+    // when the one-time orphan sweep of the directory is due.
+    staged_seen: Vec<String>,
+    staged_sweep_at: Option<std::time::Instant>,
 }
 
 /// Read the files the system asked this app to open (an `ACTION_VIEW`/`ACTION_SEND` it is registered
@@ -569,11 +573,93 @@ fn drain_incoming(bridge: &AndroidFileBridge, inbox: &Inbox, warmup: &mut i64) {
     }
 }
 
+impl PhotoCraftAndroidApp {
+    /// The staged copy of a document, if `path` names one: a *direct* child of the app's own
+    /// `media/` directory (see PhotoCraftActivity.newStageFile). Anything else on the device is
+    /// never touched.
+    fn staged_media_file(&self, path: &str) -> Option<PathBuf> {
+        let files = self.bridge.files_dir().ok()?;
+        let media = files.join("media");
+        let file = PathBuf::from(path);
+        (file.parent() == Some(media.as_path())).then_some(file)
+    }
+
+    /// Delete every staged copy under `media/` that neither the recent list nor an open document
+    /// refers to, sparing files written in the last minute (a document may be mid-import). This
+    /// clears out copies orphaned before this pruning existed, or by an app killed mid-session.
+    fn staged_sweep_orphans(bridge: &AndroidFileBridge, recent: &[String], open: &[String]) {
+        let Ok(files) = bridge.files_dir() else { return };
+        let media = files.join("media");
+        let Ok(entries) = fs::read_dir(&media) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if recent.iter().any(|keep| Path::new(keep) == path.as_path())
+                || open.iter().any(|keep| Path::new(keep) == path.as_path())
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let fresh = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_secs(60));
+            if fresh {
+                continue;
+            }
+            let name = path.to_string_lossy().into_owned();
+            match fs::remove_file(&path) {
+                Ok(()) => log::info!("deleted an orphaned staged copy: {name}"),
+                Err(error) => log::warn!("could not delete the staged copy {name}: {error}"),
+            }
+        }
+    }
+
+    /// When an entry leaves the recent-files list (the list is cleared, an entry is removed with
+    /// its ×, or it ages out of the capped list) and no open document is showing that file, its
+    /// staged copy under `media/` is deleted: the document's original still lives at its SAF
+    /// location. The `uri:` mapping in SharedPreferences is deliberately kept, so re-opening the
+    /// same document reuses the same path and a later save still reaches the original. A delayed
+    /// sweep of the whole directory clears out copies this diff never saw (an older session, or a
+    /// crash); it runs once, half a minute after start, to let session restore finish first.
+    fn staged_prune_tick(&mut self) {
+        let current: Vec<String> = self.inner.ui.recent_files.clone();
+        let open: Vec<String> = self
+            .inner
+            .session
+            .documents()
+            .iter()
+            .filter_map(|doc| doc.path.clone())
+            .collect::<Vec<_>>();
+        for stale in self
+            .staged_seen
+            .iter()
+            .filter(|path| !current.contains(*path) && !open.contains(*path))
+        {
+            let Some(file) = self.staged_media_file(stale) else { continue };
+            match fs::remove_file(&file) {
+                Ok(()) => log::info!("deleted the staged copy of a recent file the app let go: {stale}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => log::warn!("could not delete the staged copy {stale}: {error}"),
+            }
+        }
+        if self.staged_sweep_at.is_some_and(|at| std::time::Instant::now() >= at) {
+            self.staged_sweep_at = None;
+            Self::staged_sweep_orphans(&self.bridge, &current, &open);
+        }
+        self.staged_seen = current;
+    }
+}
+
 impl eframe::App for PhotoCraftAndroidApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.picker.poll(&self.bridge, ctx);
         // Deliver any file the system asked us to open through the app's own inbox.
         drain_incoming(&self.bridge, &self.intent_inbox, &mut self.intent_warmup);
+        self.staged_prune_tick();
         self.inner.logic(ctx, frame);
     }
 
@@ -648,6 +734,8 @@ fn android_main(android_app: AndroidApp) {
                 modifiers: egui::Modifiers::default(),
                 intent_inbox: app_intent_inbox.clone(),
                 intent_warmup: 2,
+                staged_seen: Vec::new(),
+                staged_sweep_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
             }))
         }),
     );
