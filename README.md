@@ -1,4 +1,5 @@
 # ArtCraft Android Builder
+## Go to [Releases](https://github.com/MostafaXS1/artcraft-android/releases/) to download the apps.
 
 Build locally signed, 64-bit ARM (arm64) Android APKs from the official Storytold repositories for the ArtCraft apps.
 
