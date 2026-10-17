@@ -252,6 +252,48 @@ else
     git clone --depth 1 "$REPO" "$SRC"
 fi
 
+# Upstream `main` is normally green, but a regression can sit there for a while (the upstream
+# preset-loader fix landed broken on 2026-10-17 and took its CI red). Each fix-up below is
+# guarded: it edits the checkout only while the broken text is still present, and is a silent
+# no-op once upstream repairs it, so nothing is frozen or permanently forked. Keep this list tiny
+# and delete entries once upstream has shipped the fix.
+python3 - "$SRC" "$APP" "$TITLE" <<'PY'
+from pathlib import Path
+import sys
+
+src, app, title = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+
+def fix(rel: str, old: str, new: str) -> bool:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    if old not in text or new in text or text.count(old) != 1:
+        return False
+    path.write_text(text.replace(old, new, 1))
+    return True
+
+
+fixed = []
+if app == "photocraft":
+    # "load each persisted preset set independently" added `export_presets` to the serialised
+    # `Persisted` set and to its write path, but not to the read initialiser, so the crate no
+    # longer compiles. Fill in the missing field; the code below it already reads it back.
+    if fix(
+        "crates/engine/src/presets/mod.rs",
+        '            recent_documents: take(&mut m, "recent_documents"),\n',
+        '            recent_documents: take(&mut m, "recent_documents"),\n'
+        '            export_presets: take(&mut m, "export_presets"),\n',
+    ):
+        fixed.append("crates/engine/src/presets/mod.rs")
+
+if fixed:
+    print(f"  Repaired upstream compile errors still present in {title}: {', '.join(fixed)}")
+PY
+
 say 4 "Preparing the NativeActivity launcher..."
 if [[ -x "adapters/$APP/prepare.sh" ]]; then
     echo "Using app-specific adapter: adapters/$APP/prepare.sh"

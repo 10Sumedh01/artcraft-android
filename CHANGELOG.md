@@ -18,6 +18,14 @@
   path through their document API (`open_path`, `import::open`, `session.open`, …). This also works
   while the app is already running, through `onNewIntent`.
 
+### Fixed
+- A transient upstream compile error on an app's `main` can no longer block the build. Before
+  preparing the launcher, the builder runs a small repair step that fills in the `export_presets`
+  field PhotoCraft's preset loader is missing (the regression introduced by "load each persisted
+  preset set independently"). The step only edits the file while the broken text is present, so it
+  is a no-op once upstream ships the fix, and the entry can then be deleted; the checkout is still
+  never reset.
+
 ### Supported apps
 photocraft, vectorcraft, filmcraft, lightcraft, pdfcraft, effectcraft,
 designcraft, figcraft, wordcraft, soundcraft, deckcraft, cadcraft, gridcraft
