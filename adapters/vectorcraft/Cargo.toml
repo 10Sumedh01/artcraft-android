@@ -20,7 +20,7 @@ jni = "0.22"
 android-activity = { version = "0.6", default-features = false, features = ["native-activity"] }
 
 [package.metadata.android]
-package = "ai.storyteller.vectorcraft"
+package = "com.artcraft.vectorcraft"
 apk_name = "vectorcraft"
 build_targets = ["aarch64-linux-android"]
 resources = "res"

@@ -17,7 +17,7 @@ Required:
 
 Options:
   -appname=<name>     Override the display name (default: app's built-in title)
-  -packagename=<pkg>  Override the Android package (default: ai.storyteller.<app>)
+  -packagename=<pkg>  Override the Android package (default: com.artcraft.<app>)
   -appicon=<path>     Use a custom launcher icon PNG (default: app's own icon)
   -h, --help          Show this help
 
@@ -120,6 +120,23 @@ fail() {
     echo "No source checkout or existing project files were deleted." >&2
     exit 1
 }
+
+# Only one build may run at a time, and the runs are not independent. `prepare.sh` replaces the
+# launcher crate under source/<app>/apps/<app>-android, and this script later runs cargo-apk2 from
+# that very directory (`cd "$ANDROID_DIR"`), which is where javac inherits its working directory. A
+# second build that wipes it mid-compile kills the first one with "Error occurred during
+# initialization of VM ... Could not determine current working directory", which points nowhere near
+# the real cause. Refuse up front instead, naming the process that holds the lock.
+BUILD_LOCK="$ROOT/.artcraft-build.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec {BUILD_LOCK_FD}>>"$BUILD_LOCK"
+    if ! flock -n "$BUILD_LOCK_FD"; then
+        BUILD_LOCK_HOLDER="$(cat "$BUILD_LOCK" 2>/dev/null || true)"
+        fail "another build is already running${BUILD_LOCK_HOLDER:+ (pid $BUILD_LOCK_HOLDER)}. Run builds one after another: two at once replace each other's launcher crate and both can fail. If that process is gone, just run this again. ($BUILD_LOCK)"
+    fi
+    : >"$BUILD_LOCK"
+    printf '%s\n' "$$" >&"$BUILD_LOCK_FD"
+fi
 
 say 1 "Checking build tools..."
 command -v git >/dev/null 2>&1 || fail "git is required."
@@ -315,7 +332,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "20"
+GENERATOR_VERSION = "23"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -488,7 +505,6 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, _inbox: &SafInbox) {
 SAF_RECIPES = {
     "designcraft": {
         "activity": "DesignCraftActivity",
-        "stage": "designcraft-saf",
         "imports": "use designcraft_ui_egui::{ImportRequest, ImportedFile};\nuse std::collections::HashMap;\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::sync::{Arc, Mutex};",
         "state": '''
 pub type SafInbox = designcraft_ui_egui::Inbox;
@@ -633,7 +649,6 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, inbox: &SafInbox) {
     },
     "deckcraft": {
         "activity": "DeckCraftActivity",
-        "stage": "deckcraft-saf",
         "imports": "mod audio;\nuse deckcraft_ui_egui::{InboxEvent, InboxFile};\nuse std::collections::HashMap;\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::sync::{Arc, Mutex};",
         "state": '''
 pub type SafInbox = deckcraft_ui_egui::Inbox;
@@ -780,7 +795,6 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, inbox: &SafInbox) {
     },
     "gridcraft": {
         "activity": "GridCraftActivity",
-        "stage": "gridcraft-saf",
         "imports": "use std::collections::HashMap;\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::sync::{Arc, Mutex};",
         "state": '''
 pub type SafInbox = gridcraft_ui_egui::Inbox;
@@ -937,7 +951,6 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, _inbox: &SafInbox) {
     },
     "wordcraft": {
         "activity": "WordCraftActivity",
-        "stage": "wordcraft-saf",
         "imports": "use std::collections::HashMap;\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::sync::{Arc, Mutex};",
         "state": '''
 pub type SafInbox = wordcraft_ui_egui::Inbox;
@@ -1073,7 +1086,6 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, inbox: &SafInbox) {
     # ---- Synchronous file-dialog apps: the app asks for a path and continues at once. ----
     "effectcraft": {
         "activity": "EffectCraftActivity",
-        "stage": "effectcraft-saf",
         "imports": "use effectcraft_ui_egui::Hooks;\nmod audio_out;\n" + SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE + '''
 /// Open the picker allowing several files at once (imports take a list); empty on cancel or error.
@@ -1140,7 +1152,6 @@ fn saf_hooks(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> Hoo
     },
     "filmcraft": {
         "activity": "FilmCraftActivity",
-        "stage": "filmcraft-saf",
         "imports": "use filmcraft_ui_egui::HostHooks;\nmod audio;\n" + SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": '''
@@ -1204,7 +1215,6 @@ fn saf_hooks(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> Hos
     },
     "lightcraft": {
         "activity": "LightCraftActivity",
-        "stage": "lightcraft-saf",
         "imports": SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE + '''
 /// Write to the staged private path, then push it through SAF when it was a chosen destination
@@ -1313,7 +1323,6 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> 
     },
     "cadcraft": {
         "activity": "CadCraftActivity",
-        "stage": "cadcraft-saf",
         "imports": SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": '''
@@ -1332,7 +1341,6 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> 
     },
     "soundcraft": {
         "activity": "SoundCraftActivity",
-        "stage": "soundcraft-saf",
         "imports": SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": '''
@@ -1358,7 +1366,6 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> 
     # per-frame poll delivers the system picker's answer.
     "pdfcraft": {
         "activity": "PdfCraftActivity",
-        "stage": "pdfcraft-saf",
         "imports": SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": "",
@@ -1417,7 +1424,6 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, _inbox: &SafInbox) {
     # ---- figcraft: a Services trait (not a struct) injected as Box<dyn Services>. ----
     "figcraft": {
         "activity": "FigCraftActivity",
-        "stage": "figcraft-saf",
         "imports": "use figcraft_ui_egui::Services;\n" + SYNC_SAF_IMPORTS,
         "state": SYNC_SAF_STATE,
         "services": '''
@@ -1679,18 +1685,28 @@ PERSIST_RECIPES = {
 
 # Shared Rust helpers the recipes above call (single braces: not interpolated as format fields).
 PERSIST_SUPPORT = r'''
-/// The app's private files directory (`/data/user/0/<pkg>/files`) plus a `config` subfolder, where
-/// the settings, preferences and recent-files list are kept. The folder survives restarts and app
-/// updates, which is what the desktop versions get from their per-user config folder.
+/// The app's private storage directory. Android exposes two: the internal one
+/// (`/data/user/0/<pkg>/files`), which a file manager or a computer never sees, and the app-specific
+/// external one (`/storage/emulated/0/Android/data/<pkg>/files`), which the user can reach over USB
+/// or MTP without root. The external directory is preferred so the settings, autosaves and exported
+/// documents are actually findable; the internal directory is the fallback for the rare device where
+/// external storage is unmounted or unavailable. Both survive restarts and app updates.
+fn app_data_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
+    app.external_data_path().or_else(|| app.internal_data_path())
+}
+
+/// The app's private files directory plus a `config` subfolder, where the settings, preferences and
+/// recent-files list are kept. The folder survives restarts and app updates, which is what the
+/// desktop versions get from their per-user config folder.
 fn persist_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
-    app.internal_data_path().map(|base| base.join("config"))
+    app_data_dir(app).map(|base| base.join("config"))
 }
 
 /// Point the platform path helpers at app-private storage before the app reads them, so anything
 /// the app writes itself (autosave, recovery copies, caches) also lands there.
 #[allow(unused_unsafe)]
 fn install_persist_env(app: &AndroidApp) {
-    let Some(base) = app.internal_data_path() else { return };
+    let Some(base) = app_data_dir(app) else { return };
     let config = base.join("config");
     let cache = base.join("cache");
     let home = base.join("home");
@@ -1826,10 +1842,15 @@ if appicon:
     if not icon.is_file():
         raise SystemExit(f"App icon not found: {appicon}")
 else:
+    # The icon lives in the app's own source tree, where upstream still names it after its original
+    # `ai.storyteller.<app>` package, so that spelling comes first; the `com.artcraft.<app>` and bare
+    # `<app>` spellings are kept as fallbacks in case upstream renames the asset.
     icon_candidates = [
         src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"ai.storyteller.{app}.png",
+        src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"com.artcraft.{app}.png",
         src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"{app}.png",
         src / "assets" / "app-icon" / f"ai.storyteller.{app}.png",
+        src / "assets" / "app-icon" / f"com.artcraft.{app}.png",
         src / "assets" / "app-icon" / f"{app}.png",
     ]
     icon = next((p for p in icon_candidates if p.is_file()), None)
@@ -1908,7 +1929,7 @@ exported = true
 intent_filter = {intent_filter_value}
 '''
 
-    package_name = packagename if packagename else f"ai.storyteller.{app}"
+    package_name = packagename if packagename else f"com.artcraft.{app}"
     # Read the app's version from the source workspace manifest so the APK is named photocraft-0.8.0.apk.
     try:
         app_version = ws["workspace"]["package"]["version"]
@@ -1968,13 +1989,12 @@ icon = "@mipmap/ic_launcher"
     (staging_dir / "Cargo.toml").write_text(manifest)
 
     if saf:
-        pkg = packagename if packagename else f"ai.storyteller.{app}"
+        pkg = packagename if packagename else f"com.artcraft.{app}"
         java_src = (root / "templates" / "android" / "SafActivity.java").read_text()
         java_src = (
             java_src.replace("__PACKAGE__", pkg)
             .replace("__CLASS__", saf["activity"])
             .replace("__TAG__", saf["activity"])
-            .replace("__STAGE__", saf["stage"])
         )
         java_dir = staging_dir / "java" / Path(*pkg.split("."))
         java_dir.mkdir(parents=True, exist_ok=True)
@@ -2799,6 +2819,35 @@ BUILD_START_EPOCH="$(date +%s)"
 LOG="logs/$APP-$MODE-$STAMP.log"
 cd "$ANDROID_DIR"
 
+# The APK is named after the version the app's own source declares, so a release built from
+# `vectorcraft` v0.12.0 lands as `output/vectorcraft-0.12.0.apk` instead of a version-less
+# `vectorcraft-release.apk`. Read the workspace `[workspace.package] version` (the value cargo bakes
+# into the APK's own `versionName`) and fall back to the launcher crate's version for sources that do
+# not pin one at the workspace level.
+APP_VERSION="$(python3 - "$ROOT/$SRC" "$APP" <<'PY'
+import pathlib, sys, tomllib
+
+root, app = pathlib.Path(sys.argv[1]), sys.argv[2]
+for path in (
+    root / "Cargo.toml",
+    root / "apps" / app / "Cargo.toml",
+    root / "apps" / (app + "-android") / "Cargo.toml",
+):
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        continue
+    version = data.get("workspace", {}).get("package", {}).get("version")
+    if not version:
+        version = data.get("package", {}).get("version")
+    if isinstance(version, str) and version:
+        print(version)
+        break
+else:
+    print("0.0.0")
+PY
+)"
+
 # FigCraft and DeckCraft set `CRAFT_FONTS_DIR = "../craft-fonts"` (relative) in .cargo/config.toml.
 # cargo-subcommand, which cargo-apk uses to locate the workspace, canonicalizes that path and aborts
 # with an I/O error when the directory is absent. Create an (empty) directory so the path resolves;
@@ -2815,7 +2864,7 @@ if [[ "$MODE" == "release" ]]; then
         status=$?
         fail "Release build failed (exit $status). Log: $ROOT/$LOG"
     fi
-    FINAL_APK="$ROOT/output/$APP-release.apk"
+    FINAL_APK="$ROOT/output/$APP-$APP_VERSION.apk"
 else
     if CARGO_APK_DEV_KEYSTORE="$ROOT/$KEY" \
        CARGO_APK_DEV_KEYSTORE_PASSWORD="$KEY_PASSWORD" \
@@ -2825,7 +2874,7 @@ else
         status=$?
         fail "Debug build failed (exit $status). Log: $ROOT/$LOG"
     fi
-    FINAL_APK="$ROOT/output/$APP-debug.apk"
+    FINAL_APK="$ROOT/output/$APP-$APP_VERSION-debug.apk"
 fi
 
 # cargo-apk and cargo-apk2 have used slightly different APK output subdirectories/names.

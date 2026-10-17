@@ -23,7 +23,7 @@ jni = "0.22"
 android-activity = { version = "0.6", default-features = false, features = ["native-activity"] }
 
 [package.metadata.android]
-package = "ai.storyteller.photocraft"
+package = "com.artcraft.photocraft"
 apk_name = "photocraft"
 build_targets = ["aarch64-linux-android"]
 resources = "res"

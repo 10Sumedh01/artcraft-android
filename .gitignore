@@ -11,6 +11,9 @@ source/
 # Backups
 backups/
 
+# Held by lib/build-common.sh while a build is running (one build at a time)
+.artcraft-build.lock
+
 # Python bytecode caches
 __pycache__/
 *.pyc

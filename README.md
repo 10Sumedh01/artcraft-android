@@ -31,7 +31,7 @@ App names are passed as command-line flags, such as `-photocraft` or `-vectorcra
 | Option | Description |
 | --- | --- |
 | `-appname=<name>` | Override the Android display name. By default, the app's built-in title is used. |
-| `-packagename=<pkg>` | Override the Android package name. By default, the package is `ai.storyteller.<app>`. |
+| `-packagename=<pkg>` | Override the Android package name. By default, the package is `com.artcraft.<app>`. |
 | `-appicon=<path>` | Use a custom launcher icon PNG. By default, the app's own icon is used. |
 | `-h`, `--help` | Show command help. |
 
@@ -61,8 +61,8 @@ bash build.sh -photocraft \
 
 | Path | Contents |
 | --- | --- |
-| `output/<app>-release.apk` | Optimized release APK |
-| `output/<app>-debug.apk` | Debug APK |
+| `output/<app>-<version>.apk` | Optimized release APK, versioned from the app's own source manifest (e.g. `output/vectorcraft-0.12.0.apk`) |
+| `output/<app>-<version>-debug.apk` | Debug APK |
 | `source/<app>/` | Source checkout and generated NativeActivity crate |
 | `build/<app>/target/` | Isolated Cargo build output for the app |
 | `logs/` | Build logs for diagnosis |
@@ -92,9 +92,13 @@ A failed build is recorded under `logs/`. Use [`adapters/README.md`](adapters/RE
 
 ### Preferences and recovery files
 
-Each generated launcher persists the app's preferences to its private files directory under `config` and restores them at startup. Platform path helpers such as `HOME` and `XDG_*` are pointed at the same app-private location so that app-written autosave and recovery files are stored there as well.
+Each launcher persists the app's preferences under `config` in the app's private storage and restores them at startup. Platform path helpers such as `HOME` and `XDG_*` are pointed at the same location so that app-written autosave and recovery files are stored there as well.
 
-PhotoCraft already saves through its adapter.
+That storage is the app-specific external directory, `/storage/emulated/0/Android/data/com.artcraft.<app>/files`, rather than the internal `/data/user/0/<pkg>/files`. External storage is reachable from a phone file manager and over USB/MTP, which makes settings, autosaves and exports findable; internal storage is invisible without root. The internal directory is used only as a fallback when external storage is unavailable. Android 11+ hides `Android/data` from the on-device document picker, so use USB/MTP or `adb` to browse it.
+
+A document opened through Storage Access Framework (SAF) is staged as `<files>/media/<document name>`, so the working copy the app edits is easy to find and the same document always maps to the same path. If that name is already taken by another document, a ` (2)`-style suffix is added rather than sharing the file.
+
+PhotoCraft and VectorCraft save through their adapters, which use the same external location.
 
 ### System fonts
 
@@ -127,7 +131,7 @@ Every app is registered with Android's **Open with** and share sheets for the fi
 | CAD drawings | CADCraft |
 | App-specific project formats | The corresponding app |
 
-File associations are centralized in [`lib/file_associations.py`](lib/file_associations.py) and applied to launcher and adapter manifests to keep them consistent.
+File associations are centralized in [`lib/file_associations.py`](lib/file_associations.py) and applied to launcher and adapter manifests to keep them consistent. Extensions Android's MIME database knows are matched by the type it actually reports (for example `.psd` is `image/x-photoshop`, not `image/vnd.adobe.photoshop`), and every extension is also matched by file name so that a provider which stamps a generic `application/octet-stream` still offers the app. Those by-name elements pair the escaped-dot pattern with `android:host="*"` — Android only evaluates a `pathPattern` when the element also declares an authority, and without one a scheme-plus-path element matches every `file://`/`content://` URI — and the same pattern is repeated in a second, VIEW-only element declaring `mimeType="*/*"`, because a filter that declares a MIME type only matches intents that carry one. An app is therefore offered for its own extensions and types and for nothing else.
 
 When a file is opened, shared, or passed through a link, the launcher copies it into app-private storage off the UI thread and opens it through the same path used by the app's own file picker. This is supported while the app is already running as well as on initial launch.
 

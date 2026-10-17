@@ -1,9 +1,10 @@
-package ai.storyteller.photocraft;
+package com.artcraft.photocraft;
 
 import android.app.NativeActivity;
 import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
@@ -38,7 +39,6 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -68,7 +68,18 @@ public final class PhotoCraftActivity extends NativeActivity {
     // intentPoll() and opened exactly like a file chosen in the picker.
     private final ConcurrentLinkedQueue<String> intentPaths = new ConcurrentLinkedQueue<>();
 
-    public String pcFilesDir() { return getFilesDir().getAbsolutePath(); }
+    public String pcFilesDir() { return appStorageDir().getAbsolutePath(); }
+
+    /**
+     * The app's private storage root: the app-specific external directory
+     * {@code /storage/emulated/0/Android/data/<pkg>/files} whenever the device has it, so the
+     * preferences, exports and the working copies of SAF documents stay reachable over USB/MTP, and
+     * the internal directory otherwise.
+     */
+    private File appStorageDir() {
+        File external = getExternalFilesDir(null);
+        return external != null ? external : getFilesDir();
+    }
 
     private void applyImmersiveFullscreen() {
         Window window = getWindow();
@@ -372,7 +383,7 @@ public final class PhotoCraftActivity extends NativeActivity {
             try {
                 String name = displayName(uri);
                 if (name == null || name.trim().isEmpty()) name = suggestedNames.getOrDefault(id, "Untitled.pcraft");
-                File stage = newStageFile(name);
+                File stage = newStageFile(name, uri);
                 rememberUri(stage, uri);
                 enqueueSave(id, stage.getAbsolutePath());
             } catch (Exception e) {
@@ -399,7 +410,7 @@ public final class PhotoCraftActivity extends NativeActivity {
             try {
                 JSONArray paths = new JSONArray();
                 for (Uri uri : uris) {
-                    File stage = newStageFile(displayName(uri));
+                    File stage = newStageFile(displayName(uri), uri);
                     copyUriToFile(uri, stage);
                     rememberUri(stage, uri);
                     paths.put(stage.getAbsolutePath());
@@ -435,10 +446,32 @@ public final class PhotoCraftActivity extends NativeActivity {
         }
     }
 
-    private File newStageFile(String name) throws Exception {
-        File dir = new File(getFilesDir(), "PhotoCraft/saf/" + UUID.randomUUID());
-        if (!dir.mkdirs() && !dir.isDirectory()) throw new Exception("Could not create private staging directory");
-        return new File(dir, safeName(name == null ? "imported-file" : name));
+    /**
+     * The working copy of a document the user chose through SAF. It lives under {@link #appStorageDir()}
+     * so a file manager or a computer finds the file the app is editing, and inside a plain
+     * {@code media} directory named after the document rather than a random per-open directory, so the
+     * same document always lands on the same path.
+     *
+     * <p>A document that is opened again reuses its staged file; a different document whose name is
+     * already taken gets a {@code " (2)"}-style suffix, because the staged path is the key that maps
+     * back to the picked document and two documents sharing one path would overwrite each other.
+     */
+    private File newStageFile(String name, Uri uri) throws Exception {
+        File dir = new File(appStorageDir(), "media");
+        if (!dir.mkdirs() && !dir.isDirectory()) throw new Exception("Could not create the media directory");
+        String safe = safeName(name == null ? "imported-file" : name);
+        String stem = safe, extension = "";
+        int dot = safe.lastIndexOf('.');
+        if (dot > 0) { stem = safe.substring(0, dot); extension = safe.substring(dot); }
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String owner = uri == null ? null : uri.toString();
+        for (int attempt = 1; attempt <= 10000; attempt++) {
+            String candidate = attempt == 1 ? safe : stem + " (" + attempt + ")" + extension;
+            File file = new File(dir, candidate);
+            String mapped = prefs.getString("uri:" + file.getAbsolutePath(), null);
+            if (mapped == null || mapped.equals(owner)) return file;
+        }
+        throw new Exception("Could not find a free name for the selected document in " + dir);
     }
 
     private static String safeName(String name) {
@@ -528,7 +561,7 @@ public final class PhotoCraftActivity extends NativeActivity {
         io.execute(() -> {
             for (Uri uri : uris) {
                 try {
-                    File stage = newStageFile(displayName(uri));
+                    File stage = newStageFile(displayName(uri), uri);
                     copyUriToFile(uri, stage);
                     rememberUri(stage, uri);
                     intentPaths.offer(stage.getAbsolutePath());

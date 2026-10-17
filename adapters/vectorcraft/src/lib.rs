@@ -396,19 +396,29 @@ fn write_mobile(bridge: &AndroidFileBridge, path: &str, bytes: &[u8]) -> Result<
     }
 }
 
+/// The app's private storage directory. Android exposes two: the internal one
+/// (`/data/user/0/<pkg>/files`), which a file manager or a computer never sees, and the app-specific
+/// external one (`/storage/emulated/0/Android/data/<pkg>/files`), which the user can reach over USB
+/// or MTP without root. The external directory is preferred so the settings, autosaves and exported
+/// documents are actually findable; the internal directory is the fallback for the rare device where
+/// external storage is unmounted or unavailable.
+fn app_data_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
+    app.external_data_path().or_else(|| app.internal_data_path())
+}
+
 /// Where the app keeps its settings, preferences and recent-file list: the app's private files
 /// directory plus a `config` subfolder, which survives restarts and updates. The desktop app keeps
 /// these in its per-user config folder and the web app in the browser; the Android shell has
 /// neither, so it writes them here.
 fn persist_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
-    app.internal_data_path().map(|base| base.join("config"))
+    app_data_dir(app).map(|base| base.join("config"))
 }
 
 /// Point the platform path helpers at app-private storage before the app reads them, so anything
 /// the app writes itself (autosave, recovery copies, caches) also lands there.
 #[allow(unused_unsafe)]
 fn install_persist_env(app: &AndroidApp) {
-    let Some(base) = app.internal_data_path() else { return };
+    let Some(base) = app_data_dir(app) else { return };
     let config = base.join("config");
     let cache = base.join("cache");
     let home = base.join("home");

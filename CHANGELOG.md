@@ -1,5 +1,68 @@
 # Changelog
 
+## v23 — 2026-10-17
+
+### Changed
+- Release and debug APKs are now named after the version the app's own source declares, e.g.
+  `output/vectorcraft-0.12.0.apk` (debug: `output/vectorcraft-0.12.0-debug.apk`). The builder reads
+  the workspace `[workspace.package] version` from the checkout — the same value cargo writes into
+  the APK's `versionName` — so the file name always matches the build without anyone remembering to
+  pass it in. Sources that do not pin a workspace version fall back to the launcher crate's version.
+- The Android package is `com.artcraft.<app>` for all thirteen apps (the eleven generated launchers
+  and the two adapters, PhotoCraft and VectorCraft). Because the package id changes, Android treats
+  each build as a new app: uninstall the previous `ai.storyteller.*` installation before testing, or
+  it will sit next to the new one.
+- App data now lives in the app-specific external directory
+  `/storage/emulated/0/Android/data/com.artcraft.<app>/files` (settings, preferences, recent files,
+  autosaves, caches, the fontconfig cache and the working copy of every document opened through
+  Storage Access Framework) instead of the internal `/data/user/0/<pkg>/files`,
+  which a phone file manager or a connected computer cannot reach. The internal directory is kept as
+  a fallback for devices without external storage. Android 11+ still hides `Android/data` from the
+  on-device file picker; it is visible over USB/MTP.
+
+### Fixed
+- Two builds running at the same time no longer destroy each other. They share the launcher crate
+  under `source/<app>/apps/<app>-android`: `prepare.sh` replaces it, and the other run's `javac`
+  inherits its working directory from that same directory, so the second build deleted the first
+  one's working directory and it died with `java.lang.Error: Properties init: Could not determine
+  current working directory`. A lock now refuses the second build up front and names the build that
+  holds it.
+- A document opened "with" an ArtCraft app is now staged at
+  `/storage/emulated/0/Android/data/com.artcraft.<app>/files/media/<document name>` (internal storage
+  only as the fallback). It used to be hidden in the internal `/data/user/0/<pkg>/files/...`
+  directory — invisible to a phone file manager or a connected computer — inside a random per-open
+  subdirectory such as `.../files/PhotoCraft/saf/<uuid>/example.psd`, so the working copy piled up
+  under meaningless names. The same document now always maps to the same path; if the name is already
+  taken by a different document, a ` (2)`-style suffix is added rather than sharing the file, because
+  the staged path is what maps a save back to the document the user picked.
+- "Open with" now actually offers the right ArtCraft app. The intent filters were present all along,
+  but many MIME types were spelled the way the IANA register names them rather than the way Android's
+  MIME database does, and Android matches types literally: `.psd` is `image/x-photoshop` (not
+  `image/vnd.adobe.photoshop`), `.bmp` is `image/x-ms-bmp`, `.raf` is `image/x-fuji-raf`, `.rtf` is
+  `text/rtf`, `.csv` is `text/comma-separated-values`, the `.docm`/`.dotm`/`.xlsm`/`.xltm`/`.xlsb`
+  macro formats use a lower-case `macroenabled`, and so on. `lib/file_associations.py` now lists the
+  Android-reported type for every extension plus the registered alias, and the mapping is documented
+  against AOSP's `android.mime.types`/`MimeUtils` and a live device's `MediaStore`.
+- "Open with" offered every ArtCraft app for *every* file, APKs included. A `<data>` element that
+  declares a scheme and a `pathPattern` but no `android:host` does not constrain the path at all:
+  AOSP `IntentFilter.matchData` only performs the path check inside its `if (mDataAuthorities !=
+  null)` branch, so the element degenerated into a scheme-only match and claimed every `file://`
+  and `content://` URI. Path elements now also declare `android:host="*"`, which matches any
+  authority while the path pattern does the real work, and the extension glob escapes its dot
+  (`.*\.psd`) so it cannot match an unrelated name that merely ends in the same letters.
+- Files whose extension Android does not know (`.psb`, `.cr3`, `.ora`, the apps' own project
+  formats) are reported as `application/octet-stream`, which a filter that declares only a path
+  pattern does not match, because a filter that declares a MIME type makes the intent have to carry
+  one. A second, separate VIEW-only filter pairs the same path patterns with `mimeType="*/*"`, so a
+  typed chooser entry matches while the path pattern keeps the app off unrelated files. It is
+  VIEW-only because a share intent carries its file in `EXTRA_STREAM` and has no data URI, so it can
+  never match a filter that declares a scheme; shares of known types are served by the type-only
+  `SEND` filter.
+
+### Supported apps
+photocraft, vectorcraft, filmcraft, lightcraft, pdfcraft, effectcraft,
+designcraft, figcraft, wordcraft, soundcraft, deckcraft, cadcraft, gridcraft
+
 ## v20 — 2026-10-17
 
 ### Added
