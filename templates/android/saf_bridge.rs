@@ -173,6 +173,41 @@ mod saf {
                 .map_err(|e| e.to_string())
         }
 
+        /// Hand back the private path of one file the system asked us to open (an `ACTION_VIEW` /
+        /// `ACTION_SEND` the app is registered for), or `None` when nothing is pending. Each staged
+        /// copy is consumed once. Returns an error if the Activity has no intent host (an older
+        /// launcher); the caller treats that as "nothing pending" and stops asking.
+        pub fn intent_poll(&self) -> Result<Option<String>, String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it
+                    // without taking ownership or attempting to delete the reference.
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    let value = match env.call_method(
+                        &*activity,
+                        jni_str!("intentPoll"),
+                        jni_sig!("()Ljava/lang/String;"),
+                        &[],
+                    ) {
+                        Ok(value) => value.l()?,
+                        Err(error) => {
+                            // A missing `intentPoll` leaves a pending NoSuchMethodError on the shared
+                            // JNI thread (which the SAF bridge also uses); clear it before returning.
+                            env.exception_clear();
+                            return Err(error);
+                        }
+                    };
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    let value = JString::cast_local(env, value)?;
+                    let value: String = value.try_to_string(env)?;
+                    Ok(Some(value))
+                })
+                .map_err(|e| e.to_string())
+        }
+
         pub fn files_dir(&self) -> Result<PathBuf, String> {
             self.vm
                 .attach_current_thread(|env| -> jni::errors::Result<PathBuf> {

@@ -13,13 +13,22 @@ use photocraft_codecs::{ChannelLayout, EncodeOptions, Image};
 use photocraft_doc::Document;
 use photocraft_engine::Session;
 use photocraft_ui_egui::{
-    FileDialogAnswer, FileDialogReply, FileDialogRequest, PhotocraftApp, Services,
+    FileDialogAnswer, FileDialogReply, FileDialogRequest, Inbox, PhotocraftApp, Services,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+// Shared with the generated launchers: brings the device's own system fonts into the egui fallback
+// chain and makes them visible to the app's own font scanners (see templates/android/system_fonts.rs).
+mod system_fonts;
+
+// Shared with the generated launchers: turns Android's soft keyboard into egui IME events (see
+// templates/android/ime_bridge.rs). The `mod ime_bridge;` marker also keeps the vendored
+// android-activity, which forwards show/hide to this Activity's imeShow/imeHide, in step.
+mod ime_bridge;
 
 /// Emitted at startup so a device log (and the packaged `.so` strings) can confirm this shell —
 /// including the Android modifier-key fix and immersive fullscreen — is the one that is running.
@@ -94,6 +103,40 @@ impl AndroidFileBridge {
                         &[],
                     )?
                     .l()?;
+                if value.is_null() {
+                    return Ok(None);
+                }
+                let value = JString::cast_local(env, value)?;
+                let value: String = value.try_to_string(env)?;
+                Ok(Some(value))
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Hand back the private path of one file the system asked this app to open (an
+    /// `ACTION_VIEW`/`ACTION_SEND` it is registered for), or `None` when nothing is pending. Returns
+    /// an error when the Activity has no intent host; the caller then stops asking.
+    fn intent_poll(&self) -> Result<Option<String>, String> {
+        self.vm
+            .attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
+                let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it
+                // without taking ownership or attempting to delete the reference.
+                let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                let value = match env.call_method(
+                    &*activity,
+                    jni_str!("intentPoll"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                ) {
+                    Ok(value) => value.l()?,
+                    Err(error) => {
+                        // A missing `intentPoll` leaves a pending NoSuchMethodError on the shared
+                        // JNI thread (the picker bridge uses it too); clear it before returning.
+                        env.exception_clear();
+                        return Err(error);
+                    }
+                };
                 if value.is_null() {
                     return Ok(None);
                 }
@@ -309,12 +352,15 @@ fn write_mobile(bridge: &AndroidFileBridge, path: &str, bytes: &[u8]) -> Result<
     }
 }
 
-fn services(bridge: AndroidFileBridge, picker: Arc<PickerState>, prefs_path: PathBuf) -> Services {
+fn services(bridge: AndroidFileBridge, picker: Arc<PickerState>, prefs_path: PathBuf, inbox: Inbox) -> Services {
     let write_bridge = bridge.clone_for_services();
     let save_bridge = bridge.clone_for_services();
     let prefs_bridge = bridge.clone_for_services();
     let load_prefs_path = prefs_path.clone();
     Services {
+        // Files the system asked us to open (ACTION_VIEW/ACTION_SEND) are queued here and drained
+        // by the app's own per-frame inbox, exactly like a document chosen in the picker.
+        inbox: Some(inbox),
         import: Some(Box::new(
             |name: &str, bytes: &[u8], max_svg_group_depth: usize| {
                 photocraft_io::import_with_svg_group_depth(name, bytes, max_svg_group_depth)
@@ -480,20 +526,64 @@ struct PhotoCraftAndroidApp {
     inner: PhotocraftApp,
     bridge: AndroidFileBridge,
     picker: Arc<PickerState>,
+    ime: ime_bridge::ime::ImeBridge,
     modifiers: egui::Modifiers,
+    // Files the system asked us to open are staged by the Activity; this is the shared queue the
+    // app's own inbox drains. `intent_warmup` skips the first couple of frames so the app has
+    // finished its own start-up, and goes negative (stop polling) if the host has no intent bridge.
+    intent_inbox: Inbox,
+    intent_warmup: i64,
+}
+
+/// Read the files the system asked this app to open (an `ACTION_VIEW`/`ACTION_SEND` it is registered
+/// for) into the app's import inbox, exactly like a document chosen in the picker. Each staged path
+/// is read once; a launcher without the intent host stops the poll after one error.
+fn drain_incoming(bridge: &AndroidFileBridge, inbox: &Inbox, warmup: &mut i64) {
+    if *warmup > 0 {
+        *warmup -= 1;
+        return;
+    }
+    if *warmup < 0 {
+        return;
+    }
+    for _ in 0..16 {
+        match bridge.intent_poll() {
+            Ok(Some(path)) => match fs::read(&path) {
+                Ok(bytes) => {
+                    let name = Path::new(&path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "imported-file".to_string());
+                    log::info!("Opening the file the system handed the app: {path}");
+                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                }
+                Err(error) => log::error!("Could not read the incoming file {path}: {error}"),
+            },
+            Ok(None) => break,
+            Err(error) => {
+                log::info!("Launcher does not report incoming files: {error}");
+                *warmup = -1;
+                break;
+            }
+        }
+    }
 }
 
 impl eframe::App for PhotoCraftAndroidApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.picker.poll(&self.bridge, ctx);
+        // Deliver any file the system asked us to open through the app's own inbox.
+        drain_incoming(&self.bridge, &self.intent_inbox, &mut self.intent_warmup);
         self.inner.logic(ctx, frame);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        system_fonts::install_system_fonts(ui.ctx());
         self.inner.ui(ui, _frame);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.ime.poll(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         self.inner.raw_input_hook(ctx, raw);
     }
@@ -502,7 +592,8 @@ impl eframe::App for PhotoCraftAndroidApp {
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
-    log::info!("{ANDROID_SHELL_MARKER} ready");
+    log::info!("{ANDROID_SHELL_MARKER} ready; {}", ime_bridge::ime::IME_MARKER);
+    system_fonts::install_font_env(&android_app);
     let bridge = match AndroidFileBridge::new(android_app.clone()) {
         Ok(bridge) => bridge,
         Err(error) => {
@@ -524,6 +615,7 @@ fn android_main(android_app: AndroidApp) {
         }
     }
     let picker = Arc::new(PickerState::default());
+    let intent_inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PhotoCraft")
@@ -533,6 +625,7 @@ fn android_main(android_app: AndroidApp) {
     };
     let app_bridge = bridge.clone_for_services();
     let app_picker = picker.clone();
+    let app_intent_inbox = intent_inbox.clone();
     let result = eframe::run_native(
         "PhotoCraft",
         options,
@@ -544,13 +637,17 @@ fn android_main(android_app: AndroidApp) {
                     app_bridge.clone_for_services(),
                     app_picker.clone(),
                     prefs_path.clone(),
+                    app_intent_inbox.clone(),
                 ),
             );
             Ok(Box::new(PhotoCraftAndroidApp {
                 inner: app,
                 bridge: app_bridge.clone_for_services(),
                 picker: app_picker.clone(),
+                ime: ime_bridge::ime::ImeBridge::new(&app_bridge.app),
                 modifiers: egui::Modifiers::default(),
+                intent_inbox: app_intent_inbox.clone(),
+                intent_warmup: 2,
             }))
         }),
     );

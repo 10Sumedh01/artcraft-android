@@ -64,10 +64,39 @@ versions; the navigation bar often remains visible until immersive mode is expli
 Re-applying on window focus ensures the bars stay hidden after system gestures or returning from the
 SAF picker.
 
+## System fonts
+
+Adapters include the shared `mod system_fonts;`, whose source lives in
+`templates/android/system_fonts.rs`. The builder copies that file next to the adapter's `src/lib.rs`
+when it stages the Android crate (`prepare.sh` for PhotoCraft; the generator's custom-adapter path for
+VectorCraft), so the one copy stays in step with the generated launchers. The module installs the
+device's `/system/fonts` (`/product/fonts`) faces as lowest-priority egui fallbacks for scripts the
+app's own fonts cannot draw, and links that folder into the user font locations the app's scanners
+read. See the changelog for details. An adapter's `ui` must call
+`system_fonts::install_system_fonts(ui.ctx())` and its `android_main` should call
+`system_fonts::install_font_env(&android_app)` before the app starts.
+
+## Soft keyboard (IME)
+
+Adapters include the shared `mod ime_bridge;`, whose source lives in
+`templates/android/ime_bridge.rs`. The builder copies that file next to the adapter's `src/lib.rs`
+when it stages the Android crate (`prepare.sh` for PhotoCraft; the generator's custom-adapter path for
+VectorCraft), so the one copy stays in step with the generated launchers. `android-activity`'s
+`show_soft_input`/`hide_soft_input` forward to the Activity's `imeShow`/`imeHide` (see the vendored
+`vendor/android-activity`), and `ime_bridge::ime::ImeBridge::poll` drains the Activity's queued
+commit/composition/delete events into egui `ImeEvent`s each frame. An adapter's `raw_input_hook` must
+call `self.ime.poll(raw)`, and its Activity must install the hidden `EditText` (the `imeSetup()` plus
+`imeShow`/`imeHide`/`imePoll` methods in the Java subclass).
+
 ## Inspecting a build on-device
 
 Both adapters log a marker at startup (`ARTCRAFT_<APP>_ANDROID_SHELL_V2_MODIFIERS_FULLSCREEN`) and
 the SAF bridge logs its own marker, so a device log confirms which shell is running:
 
     adb logcat | grep -E 'ARTCRAFT_|PhotoCraftSAF|VectorCraftSAF'
+
+Installed system-font fallbacks log `Android: installed system fallback font <key> (U+XXXX)`, and a
+missing script is not an error (the device simply ships no font for it):
+
+    adb logcat | grep -E 'system fallback font|no system font found'
 

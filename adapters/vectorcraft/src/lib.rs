@@ -26,7 +26,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use vectorcraft_engine::Session;
 use vectorcraft_ui_egui::picks::PickRequest;
-use vectorcraft_ui_egui::{FilePick, Services, VectorcraftApp};
+use vectorcraft_ui_egui::{FilePick, Inbox, Services, VectorcraftApp};
+
+// Shared with the generated launchers: brings the device's own system fonts into the egui fallback
+// chain and makes them visible to the app's own font scanners (see templates/android/system_fonts.rs).
+mod system_fonts;
+
+// Shared with the generated launchers: turns Android's soft keyboard into egui IME events (see
+// templates/android/ime_bridge.rs). The `mod ime_bridge;` marker also keeps the vendored
+// android-activity, which forwards show/hide to this Activity's imeShow/imeHide, in step.
+mod ime_bridge;
 
 /// Emitted at startup so the builder can confirm the bridge is present in the packaged `.so`.
 const SAF_BRIDGE_MARKER: &str = "ARTCRAFT_VECTORCRAFT_SAF_BRIDGE_V1";
@@ -124,6 +133,40 @@ impl AndroidFileBridge {
                         &[],
                     )?
                     .l()?;
+                if value.is_null() {
+                    return Ok(None);
+                }
+                let value = JString::cast_local(env, value)?;
+                let value: String = value.try_to_string(env)?;
+                Ok(Some(value))
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Hand back the private path of one file the system asked this app to open (an
+    /// `ACTION_VIEW`/`ACTION_SEND` it is registered for), or `None` when nothing is pending. Returns
+    /// an error when the Activity has no intent host; the caller then stops asking.
+    fn intent_poll(&self) -> Result<Option<String>, String> {
+        self.vm
+            .attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
+                let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it
+                // without taking ownership or attempting to delete the reference.
+                let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                let value = match env.call_method(
+                    &*activity,
+                    jni_str!("intentPoll"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                ) {
+                    Ok(value) => value.l()?,
+                    Err(error) => {
+                        // A missing `intentPoll` leaves a pending NoSuchMethodError on the shared
+                        // JNI thread (the picker bridge uses it too); clear it before returning.
+                        env.exception_clear();
+                        return Err(error);
+                    }
+                };
                 if value.is_null() {
                     return Ok(None);
                 }
@@ -353,6 +396,109 @@ fn write_mobile(bridge: &AndroidFileBridge, path: &str, bytes: &[u8]) -> Result<
     }
 }
 
+/// Where the app keeps its settings, preferences and recent-file list: the app's private files
+/// directory plus a `config` subfolder, which survives restarts and updates. The desktop app keeps
+/// these in its per-user config folder and the web app in the browser; the Android shell has
+/// neither, so it writes them here.
+fn persist_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
+    app.internal_data_path().map(|base| base.join("config"))
+}
+
+/// Point the platform path helpers at app-private storage before the app reads them, so anything
+/// the app writes itself (autosave, recovery copies, caches) also lands there.
+#[allow(unused_unsafe)]
+fn install_persist_env(app: &AndroidApp) {
+    let Some(base) = app.internal_data_path() else { return };
+    let config = base.join("config");
+    let cache = base.join("cache");
+    let home = base.join("home");
+    let _ = fs::create_dir_all(config.join(".config"));
+    let _ = fs::create_dir_all(&cache);
+    let _ = fs::create_dir_all(&home);
+    // SAFETY: `android_main` runs before the app starts any worker thread, so no other thread is
+    // reading the environment here.
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &config);
+        std::env::set_var("XDG_DATA_HOME", &base);
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        std::env::set_var("HOME", &home);
+    }
+    log::info!("settings directory: {}", config.display());
+}
+
+fn persist_read(dir: &Path, name: &str) -> Option<Vec<u8>> {
+    fs::read(dir.join(name)).ok()
+}
+
+/// Write `bytes` to `dir/name` through a temporary file renamed over the old one, so a crash leaves
+/// the old file or the new one whole, never a truncated one.
+fn persist_write(dir: &Path, name: &str, bytes: &[u8]) {
+    if let Err(error) = fs::create_dir_all(dir) {
+        log::warn!("settings: {}: {error}", dir.display());
+        return;
+    }
+    let path = dir.join(name);
+    let temporary = path.with_extension("tmp");
+    let written = fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, &path));
+    if let Err(error) = written {
+        log::warn!("settings: {}: {error}", path.display());
+    }
+}
+
+/// Read a saved `ui.json` leniently: a docking layout or hidden-panel entry this version cannot
+/// read is dropped instead of discarding every setting (as the desktop app does).
+fn decode_saved_prefs(bytes: &[u8]) -> Option<vectorcraft_ui_egui::UiState> {
+    use serde_json::{Map, Value, json};
+
+    fn recover(object: &mut Map<String, Value>, hidden_key: &str) {
+        if let Some(layout) = object.get("docking")
+            && serde_json::from_value::<vectorcraft_ui_egui::UiState>(json!({"docking": layout})).is_err()
+        {
+            object.remove("docking");
+        }
+        if let Some(hidden) = object.get_mut(hidden_key) {
+            if let Value::Object(entries) = hidden {
+                entries.retain(|panel, location| {
+                    serde_json::from_value::<vectorcraft_ui_egui::UiState>(json!({"docking_hidden": {panel: location}})).is_ok()
+                });
+            } else {
+                object.remove(hidden_key);
+            }
+        }
+    }
+
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object_mut()?;
+    recover(object, "docking_hidden");
+    if let Some(Value::Array(workspaces)) = object.get_mut("custom_workspaces") {
+        for workspace in workspaces {
+            if let Some(object) = workspace.as_object_mut() {
+                recover(object, "dockingHidden");
+            }
+        }
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// Load the saved UI state and engine preferences, as the desktop app does at startup.
+fn persist_load(app: &mut VectorcraftApp, dir: &Path) {
+    if let Some(bytes) = persist_read(dir, "ui.json")
+        && let Some(ui) = decode_saved_prefs(&bytes)
+    {
+        app.ui = ui.sanitized();
+    }
+    vectorcraft_ui_egui::prefs_dialog::restore(app);
+}
+
+/// Save the UI state and engine preferences, as the desktop app does on exit.
+fn persist_save(app: &mut VectorcraftApp, dir: &Path) {
+    let mut ui = app.ui.clone();
+    ui.engine_prefs = app.session.prefs.to_json();
+    if let Ok(bytes) = serde_json::to_vec_pretty(&ui) {
+        persist_write(dir, "ui.json", &bytes);
+    }
+}
+
 /// Reconstruct egui's modifier state on Android.
 ///
 /// winit's Android backend delivers `KeyboardInput` events but never emits `ModifiersChanged`
@@ -412,11 +558,14 @@ fn apply_android_modifiers(state: &mut egui::Modifiers, raw: &mut egui::RawInput
     }
 }
 
-fn services(bridge: AndroidFileBridge, state: Arc<PickState>) -> Services {
+fn services(bridge: AndroidFileBridge, state: Arc<PickState>, inbox: Inbox) -> Services {
     let write_bridge = bridge.clone_for_services();
     let pick_bridge = bridge.clone_for_services();
     let pick_state = state.clone();
     Services {
+        // Files the system asked us to open (ACTION_VIEW/ACTION_SEND) are queued here and drained
+        // by the app's own per-frame inbox, exactly like a document chosen in the picker.
+        inbox: Some(inbox),
         // A staged document is an ordinary file in app-private storage.
         read: Some(Box::new(|path: &str| {
             fs::read(path).map_err(|e| format!("Could not read {path}: {e}"))
@@ -441,7 +590,71 @@ struct VectorCraftAndroidApp {
     inner: VectorcraftApp,
     bridge: AndroidFileBridge,
     picks: Arc<PickState>,
+    ime: ime_bridge::ime::ImeBridge,
     modifiers: egui::Modifiers,
+    persist: Option<std::path::PathBuf>,
+    persist_last: Option<std::time::Instant>,
+    // Files the system asked us to open are staged by the Activity; this is the shared queue the
+    // app's own inbox drains. `intent_warmup` skips the first couple of frames so the app has
+    // finished its own start-up, and goes negative (stop polling) if the host has no intent bridge.
+    intent_inbox: Inbox,
+    intent_warmup: i64,
+}
+
+/// Read the files the system asked this app to open (an `ACTION_VIEW`/`ACTION_SEND` it is registered
+/// for) into the app's import inbox, exactly like a document chosen in the picker. Each staged path
+/// is read once; a launcher without the intent host stops the poll after one error.
+fn drain_incoming(bridge: &AndroidFileBridge, inbox: &Inbox, warmup: &mut i64) {
+    if *warmup > 0 {
+        *warmup -= 1;
+        return;
+    }
+    if *warmup < 0 {
+        return;
+    }
+    for _ in 0..16 {
+        match bridge.intent_poll() {
+            Ok(Some(path)) => match fs::read(&path) {
+                Ok(bytes) => {
+                    let name = Path::new(&path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "imported-file".to_string());
+                    log::info!("Opening the file the system handed the app: {path}");
+                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                }
+                Err(error) => log::error!("Could not read the incoming file {path}: {error}"),
+            },
+            Ok(None) => break,
+            Err(error) => {
+                log::info!("Launcher does not report incoming files: {error}");
+                *warmup = -1;
+                break;
+            }
+        }
+    }
+}
+
+impl VectorCraftAndroidApp {
+    /// Save settings, preferences and the recent-files list, at most every two seconds. Android
+    /// can kill a backgrounded app without a clean exit, so waiting for `on_exit` alone would lose
+    /// whatever changed since the last write.
+    fn persist_tick(&mut self) {
+        let Some(dir) = self.persist.clone() else { return };
+        let now = std::time::Instant::now();
+        if self.persist_last.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(2)) {
+            return;
+        }
+        self.persist_last = Some(now);
+        persist_save(&mut self.inner, &dir);
+    }
+
+    /// Save now: the window lost focus (the app is being backgrounded) or it is exiting.
+    fn persist_now(&mut self) {
+        if let Some(dir) = self.persist.clone() {
+            persist_save(&mut self.inner, &dir);
+        }
+    }
 }
 
 impl eframe::App for VectorCraftAndroidApp {
@@ -449,23 +662,37 @@ impl eframe::App for VectorCraftAndroidApp {
         // Deliver picker answers before the app's own logic runs, so `picks::poll` resumes the
         // entry that asked in this same frame.
         poll_answers(&self.picks, &self.bridge, ctx);
+        // Then deliver any file the system asked us to open, through the same inbox.
+        drain_incoming(&self.bridge, &self.intent_inbox, &mut self.intent_warmup);
         self.inner.logic(ctx);
+        self.persist_tick();
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.ime.poll(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
+        if raw.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false))) {
+            self.persist_now();
+        }
         self.inner.raw_input_hook(raw);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        system_fonts::install_system_fonts(ui.ctx());
         self.inner.ui(ui);
+    }
+
+    fn on_exit(&mut self) {
+        self.persist_now();
     }
 }
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
-    log::info!("{SAF_BRIDGE_MARKER} ready; {ANDROID_SHELL_MARKER}");
+    log::info!("{SAF_BRIDGE_MARKER} ready; {ANDROID_SHELL_MARKER}; {}", ime_bridge::ime::IME_MARKER);
+    install_persist_env(&android_app);
+    system_fonts::install_font_env(&android_app);
     let bridge = match AndroidFileBridge::new(android_app.clone()) {
         Ok(bridge) => bridge,
         Err(error) => {
@@ -477,6 +704,7 @@ fn android_main(android_app: AndroidApp) {
         log::info!("VectorCraft app-private storage: {dir}");
     }
     let picks = Arc::new(PickState::default());
+    let intent_inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VectorCraft")
@@ -486,19 +714,29 @@ fn android_main(android_app: AndroidApp) {
     };
     let app_bridge = bridge.clone_for_services();
     let app_picks = picks.clone();
+    let app_intent_inbox = intent_inbox.clone();
     let result = eframe::run_native(
         "VectorCraft",
         options,
         Box::new(move |_cc| {
-            let app = VectorcraftApp::new(
+            let mut app = VectorcraftApp::new(
                 Session::new(),
-                services(app_bridge.clone_for_services(), app_picks.clone()),
+                services(app_bridge.clone_for_services(), app_picks.clone(), app_intent_inbox.clone()),
             );
+            let persist = persist_dir(&app_bridge.app);
+            if let Some(dir) = &persist {
+                persist_load(&mut app, dir);
+            }
             Ok(Box::new(VectorCraftAndroidApp {
                 inner: app,
                 bridge: app_bridge.clone_for_services(),
                 picks: app_picks.clone(),
+                ime: ime_bridge::ime::ImeBridge::new(&app_bridge.app),
                 modifiers: egui::Modifiers::default(),
+                persist,
+                persist_last: None,
+                intent_inbox: app_intent_inbox.clone(),
+                intent_warmup: 2,
             }))
         }),
     );

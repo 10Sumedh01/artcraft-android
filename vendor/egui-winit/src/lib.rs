@@ -1154,7 +1154,15 @@ impl State {
         }
 
         if let Some(ime) = ime {
-            if !is_toggling_ime && ime.should_interrupt_composition {
+            // The builder's Android shell owns a real, editable IME view (see
+            // templates/android/SafActivity.java). Toggling `set_ime_allowed` off then on to
+            // interrupt a composition maps there to an actual hide followed by a show of the soft
+            // keyboard — a visible flash. Android integrations interrupt composition by replacing
+            // the pre-edit text instead, so skip the toggle on Android.
+            if !cfg!(target_os = "android")
+                && !is_toggling_ime
+                && ime.should_interrupt_composition
+            {
                 // TODO(umajho): use a more proper way to interrupt composition
                 // if `winit` provides one in the future.
 

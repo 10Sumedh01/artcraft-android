@@ -263,13 +263,17 @@ import re, shutil, sys, tomllib
 
 root, src_s, app, title, target_sdk, appname, packagename, appicon = sys.argv[1:]
 root, src = Path(root), Path(src_s)
+# Shared file-association table (Android open/share intent filters), also used by the adapter
+# prepare scripts so every launcher advertises the same associations.
+sys.path.insert(0, str(root / "lib"))
+import file_associations
 android_dir = src / "apps" / f"{app}-android"
 marker = android_dir / ".artcraft-android-builder-generated"
 
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "13"
+GENERATOR_VERSION = "20"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -280,6 +284,15 @@ if (custom / "Cargo.toml").is_file() and (custom / "src" / "lib.rs").is_file():
     if android_dir.exists():
         shutil.rmtree(android_dir)
     shutil.copytree(custom, android_dir, ignore=shutil.ignore_patterns("README.md", ".git"))
+    # Ship the shared Android system-font module alongside the adapter so its launcher can pull the
+    # device's own fonts in (see templates/android/system_fonts.rs). Kept here rather than inside
+    # each adapter so the one copy stays in step with the generator.
+    shutil.copy2(root / "templates" / "android" / "system_fonts.rs", android_dir / "src" / "system_fonts.rs")
+    # The shared Android soft-keyboard bridge, referenced by `mod ime_bridge;` in the adapter.
+    shutil.copy2(root / "templates" / "android" / "ime_bridge.rs", android_dir / "src" / "ime_bridge.rs")
+    # Advertise the app's file associations (Android open/share intent filters) in the copied
+    # manifest, from the same table the generated launchers use.
+    file_associations.patch_cargo_toml(android_dir / "Cargo.toml", app)
     marker.write_text(f"{GENERATOR_VERSION}\nGenerated/copied by artcraft-android-builder; custom adapter.\n")
     print(f"Installed custom adapter from {custom}")
     raise SystemExit(0)
@@ -486,13 +499,17 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
                 open_state.requests.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
             }
         })),
+        // DesignCraft's `DownloadFn` returns a `Result`, so report a picker that will not start
+        // instead of dropping the error (older sources returned `()` and only logged it).
         download: Some(Box::new(move |name: &str, bytes: &[u8]| {
             let id = saf_next_id(&save_state);
             save_state.saves.lock().unwrap_or_else(|error| error.into_inner()).insert(id, bytes.to_vec());
             if let Err(error) = save_bridge.request_save(id, name) {
                 log::error!("Could not start the Android save picker: {error}");
                 save_state.saves.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
+                return Err(error);
             }
+            Ok(())
         })),
         inbox: Some(inbox),
         ..Services::default()
@@ -1389,6 +1406,54 @@ impl Services for SafServices {
         "construct_expr": "FigApp::new(Session::new(), Box::new(SafServices::new(saf_bridge.clone_ref(), std::sync::Arc::clone(&saf_state), saf_inbox.clone())))",
     },
 }
+
+# How the launcher opens a document the system handed it (an ACTION_VIEW/ACTION_SEND intent it is
+# registered for), once per staged file. Each entry is the body of the shell's `open_incoming`, so it
+# can use `self.inner`, `self.saf_inbox` and the `saf` bridge helpers. Apps with an import inbox
+# receive name+bytes exactly like a file chosen in the picker; the others are asked to open the
+# staged path through their own document API. Apps absent here simply ignore incoming files.
+INTENT_OPEN = {
+    "designcraft": '''        if let Err(error) = self.inner.open_dropped(path) {
+            log::error!("Could not open the incoming file {path}: {error}");
+        }
+''',
+    "deckcraft": '''        if let Err(error) = self.inner.open_path(path) {
+            log::error!("Could not open the incoming file {path}: {error}");
+        }
+''',
+    "gridcraft": '''        match std::fs::read(path) {
+            Ok(bytes) => self.saf_inbox.lock().unwrap().push((saf::picker_name(path), bytes)),
+            Err(error) => log::error!("Could not read the incoming file {path}: {error}"),
+        }
+''',
+    "wordcraft": '''        match std::fs::read(path) {
+            Ok(bytes) => self.saf_inbox.lock().unwrap().push((saf::picker_name(path), bytes)),
+            Err(error) => log::error!("Could not read the incoming file {path}: {error}"),
+        }
+''',
+    "cadcraft": '''        self.inner.open_path(path);
+''',
+    "pdfcraft": '''        self.inner.open_path(path);
+''',
+    "lightcraft": '''        if let Err(error) = lightcraft_ui_egui::import::open(&mut self.inner, vec![path.to_owned()]) {
+            log::error!("Could not open the incoming file {path}: {error}");
+        }
+''',
+    "soundcraft": '''        if let Err(error) = soundcraft_ui_egui::dialogs::run_or_ask(&mut self.inner, "session.open", serde_json::json!({ "path": path })) {
+            log::error!("Could not open the incoming file {path}: {error}");
+        }
+''',
+    "effectcraft": '''        if let Err(error) = self.inner.session.execute("file.open", serde_json::json!({ "path": path })) {
+            log::error!("Could not open the incoming file {path}: {error}");
+        }
+''',
+    "filmcraft": '''        if let Err(error) = self.inner.file_dialog("file.open", &serde_json::json!({ "path": path })) {
+            log::error!("Could not open the incoming file {path}: {error}");
+        }
+''',
+    "figcraft": '''        let _ = self.inner.run("file.open", serde_json::json!({ "path": path }));
+''',
+}
 saf = SAF_RECIPES.get(app)
 
 stem = app[:-len("craft")] if app.endswith("craft") else app
@@ -1416,12 +1481,301 @@ ui_ident = ui_pkg.replace("-", "_")
 construct = spec.get("construct", "{app}::new(Session::new(), Services::default())").format(
     app=app_type, engine=engine_ident, ui=ui_ident
 )
+
+# ---- Saving on Android: settings, preferences and the recent-files list ----------------------
+# The desktop apps load and save these in `apps/<app>/src/main.rs` (a per-user config folder via
+# `HOME`/`XDG_CONFIG_HOME`), and the web apps keep them in the browser. Neither is compiled into
+# the generated NativeActivity launcher, so on Android nothing was written and every launch started
+# from the defaults — settings, preferences and "recent files" were forgotten (only PhotoCraft, a
+# custom adapter, had wired this up). The launcher now reproduces each app's own load/save calls,
+# pointed at the app's private files directory (`AndroidApp::internal_data_path()`), which survives
+# restarts and updates.
+#
+# `@UI@`/`@ENGINE@` become the app's crate idents. `inner` is the app and `dir` its config folder;
+# `persist_read`/`persist_write` are the shared helpers below.
+PERSIST_RECIPES = {
+    "wordcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "ui.json") {
+        if let Some(ui) = @UI@::UiState::from_json(&bytes) {
+            inner.apply_prefs(ui);
+        }
+    }''',
+        "save": '''match serde_json::to_vec_pretty(&inner.prefs()) {
+        Ok(bytes) => persist_write(dir, "ui.json", &bytes),
+        Err(error) => log::warn!("saving settings: {error}"),
+    }''',
+    },
+    "designcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "ui.json") {
+        if let Ok(ui) = @UI@::UiState::from_preferences_json(&bytes) {
+            inner.ui = ui;
+        }
+    }
+    if let Some(bytes) = persist_read(dir, "prefs.json") {
+        if let Ok(prefs) = serde_json::from_slice::<@ENGINE@::Prefs>(&bytes) {
+            inner.session.prefs = prefs;
+        }
+    }''',
+        "save": '''if let Ok(bytes) = serde_json::to_vec_pretty(&inner.ui) {
+        persist_write(dir, "ui.json", &bytes);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&inner.session.prefs) {
+        persist_write(dir, "prefs.json", &bytes);
+    }''',
+    },
+    "lightcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "ui.json") {
+        match serde_json::from_slice::<@UI@::UiState>(&bytes) {
+            Ok(ui) => inner.ui = ui.sanitized(),
+            Err(error) => log::warn!("settings: {error}"),
+        }
+    }''',
+        "save": '''if let Ok(bytes) = serde_json::to_vec_pretty(&inner.ui) {
+        persist_write(dir, "ui.json", &bytes);
+    }''',
+    },
+    "gridcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "ui.json") {
+        if let Ok(ui) = serde_json::from_slice::<@UI@::UiState>(&bytes) {
+            inner.ui = ui;
+        }
+    }
+    if let Some(bytes) = persist_read(dir, "prefs.json") {
+        if let Ok(prefs) = serde_json::from_slice(&bytes) {
+            inner.session.prefs = prefs;
+        }
+    }''',
+        "save": '''if let Ok(bytes) = serde_json::to_vec_pretty(&inner.ui) {
+        persist_write(dir, "ui.json", &bytes);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&inner.session.prefs) {
+        persist_write(dir, "prefs.json", &bytes);
+    }''',
+    },
+    "deckcraft": {
+        "load": '''let (ui, prefs) = @UI@::settings::load(dir);
+    if let Some(ui) = ui {
+        inner.ui = ui;
+    }
+    if let Some(prefs) = prefs {
+        inner.session.prefs = prefs;
+    }''',
+        "save": '''@UI@::settings::save(dir, &inner.ui, &inner.session.prefs);''',
+    },
+    "soundcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "ui.json") {
+        if let Ok(ui) = serde_json::from_slice::<@UI@::UiState>(&bytes) {
+            inner.ui = ui;
+        }
+    }''',
+        "save": '''if let Ok(bytes) = serde_json::to_vec_pretty(&inner.ui) {
+        persist_write(dir, "ui.json", &bytes);
+    }''',
+    },
+    "cadcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "prefs.json") {
+        if let Ok(json) = std::str::from_utf8(&bytes) {
+            inner.load_prefs(json);
+        }
+    }
+    if let Some(bytes) = persist_read(dir, "profile.json") {
+        if let Ok(json) = std::str::from_utf8(&bytes) {
+            inner.load_profile(json);
+        }
+    }
+    if let Some(bytes) = persist_read(dir, "autosave.json") {
+        if let Ok(json) = std::str::from_utf8(&bytes) {
+            @UI@::autosave::load_prefs(json);
+        }
+    }
+    inner.enable_autosave(&dir.join("autosave"));
+    inner.session.set_lisp_support_dir(Some(dir.join("support")));''',
+        "save": '''persist_write(dir, "prefs.json", inner.prefs_json().as_bytes());
+    persist_write(dir, "profile.json", inner.profile_json().as_bytes());
+    persist_write(dir, "autosave.json", @UI@::autosave::prefs_json().as_bytes());''',
+    },
+    "effectcraft": {
+        "load": '''inner.session.config = Some(std::sync::Arc::new(@ENGINE@::config::DirConfig::new(dir)));
+    inner.session.load_settings();''',
+        "save": '''inner.session.save_prefs();''',
+    },
+    "filmcraft": {
+        "load": '''let cfg = @ENGINE@::autosave::AutosaveConfig::new(dir.to_path_buf());
+    if let Err(error) = inner.session.start_autosave(cfg) {
+        log::warn!("auto-save and crash recovery unavailable: {error}");
+    }''',
+        "save": '''let prefs = inner.session.prefs.clone();
+    if let Err(error) = inner.session.set_prefs(prefs) {
+        log::warn!("saving preferences: {error}");
+    }''',
+    },
+    "pdfcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "ui.json") {
+        if let Ok(json) = std::str::from_utf8(&bytes) {
+            inner.restore(json);
+        }
+    }
+    if let Some(recovery) = @UI@::RecoveryStore::default_dir() {
+        inner.enable_recovery(@UI@::RecoveryStore::new(recovery));
+    }''',
+        "save": '''persist_write(dir, "ui.json", inner.persist().as_bytes());''',
+    },
+    "figcraft": {
+        "load": '''if let Some(bytes) = persist_read(dir, "state.json") {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(prefs) = value.get("prefs").and_then(|p| serde_json::from_value::<@ENGINE@::Prefs>(p.clone()).ok()) {
+                inner.session.prefs = prefs;
+            }
+        }
+    }''',
+        "save": '''match serde_json::to_string(&serde_json::json!({ "prefs": inner.session.prefs })) {
+        Ok(json) => persist_write(dir, "state.json", json.as_bytes()),
+        Err(error) => log::warn!("saving preferences: {error}"),
+    }''',
+    },
+}
+
+# Shared Rust helpers the recipes above call (single braces: not interpolated as format fields).
+PERSIST_SUPPORT = r'''
+/// The app's private files directory (`/data/user/0/<pkg>/files`) plus a `config` subfolder, where
+/// the settings, preferences and recent-files list are kept. The folder survives restarts and app
+/// updates, which is what the desktop versions get from their per-user config folder.
+fn persist_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
+    app.internal_data_path().map(|base| base.join("config"))
+}
+
+/// Point the platform path helpers at app-private storage before the app reads them, so anything
+/// the app writes itself (autosave, recovery copies, caches) also lands there.
+#[allow(unused_unsafe)]
+fn install_persist_env(app: &AndroidApp) {
+    let Some(base) = app.internal_data_path() else { return };
+    let config = base.join("config");
+    let cache = base.join("cache");
+    let home = base.join("home");
+    let _ = std::fs::create_dir_all(config.join(".config"));
+    let _ = std::fs::create_dir_all(&cache);
+    let _ = std::fs::create_dir_all(&home);
+    // SAFETY: `android_main` runs before the app starts any worker thread, so no other thread is
+    // reading the environment here.
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &config);
+        std::env::set_var("XDG_DATA_HOME", &base);
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        std::env::set_var("HOME", &home);
+    }
+    log::info!("settings directory: {}", config.display());
+}
+
+#[allow(dead_code)]
+fn persist_read(dir: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(dir.join(name)).ok()
+}
+
+/// Write `bytes` to `dir/name` through a temporary file renamed over the old one, so a crash leaves
+/// the old file or the new one whole, never a truncated one.
+#[allow(dead_code)]
+fn persist_write(dir: &std::path::Path, name: &str, bytes: &[u8]) {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        log::warn!("settings: {}: {error}", dir.display());
+        return;
+    }
+    let path = dir.join(name);
+    let temporary = path.with_extension("tmp");
+    let written = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, &path));
+    if let Err(error) = written {
+        log::warn!("settings: {}: {error}", path.display());
+    }
+}
+'''
+
+PERSIST_METHODS = r'''
+    /// Save settings, preferences and the recent-files list, at most every two seconds. Android
+    /// can kill a backgrounded app without a clean exit, so waiting for `on_exit` alone would lose
+    /// whatever changed since the last write.
+    fn persist_tick(&mut self) {
+        let Some(dir) = self.persist.clone() else { return };
+        let now = std::time::Instant::now();
+        if self.persist_last.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(2)) {
+            return;
+        }
+        self.persist_last = Some(now);
+        persist_save(&mut self.inner, &dir);
+    }
+
+    /// Save now: the window lost focus (the app is being backgrounded) or it is exiting.
+    fn persist_now(&mut self) {
+        if let Some(dir) = self.persist.clone() {
+            persist_save(&mut self.inner, &dir);
+        }
+    }
+'''
+
+PERSIST_HOOK = '''        if raw.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false))) {
+            self.persist_now();
+        }
+'''
+
+PERSIST_ON_EXIT = '''
+    fn on_exit(&mut self) {
+        self.persist_now();
+    }
+'''
+
+_persist = PERSIST_RECIPES.get(app)
+if _persist:
+    _load = _persist["load"].replace("@UI@", ui_ident).replace("@ENGINE@", engine_ident)
+    _save = _persist["save"].replace("@UI@", ui_ident).replace("@ENGINE@", engine_ident)
+    persist_support = PERSIST_SUPPORT + f'''
+fn persist_load(inner: &mut {app_type}, dir: &std::path::Path) {{
+{_load}
+}}
+
+fn persist_save(inner: &mut {app_type}, dir: &std::path::Path) {{
+{_save}
+}}
+'''
+    persist_fields = "\n    persist: Option<std::path::PathBuf>,\n    persist_last: Option<std::time::Instant>,"
+    persist_new_body = "let persist = persist_dir(&app);\n        if let Some(dir) = &persist {\n            persist_load(&mut inner, dir);\n        }\n        "
+    persist_new_init = ", persist, persist_last: None"
+    persist_methods = PERSIST_METHODS
+    persist_logic = "        self.persist_tick();\n"
+    persist_hook = PERSIST_HOOK
+    persist_on_exit = PERSIST_ON_EXIT
+    persist_env_call = "    install_persist_env(&android_app);\n"
+else:
+    persist_support = ""
+    persist_fields = ""
+    persist_new_body = ""
+    persist_new_init = ""
+    persist_methods = ""
+    persist_logic = ""
+    persist_hook = ""
+    persist_on_exit = ""
+    persist_env_call = ""
 # A type that does not implement `eframe::App` is an inner app state; its desktop `main.rs` wraps it
 # in a tiny struct that forwards `logic`/`ui`. Emit the same wrapper here.
 has_eframe_app = bool(re.search(r"impl\s+eframe::App\s+for\s+" + re.escape(app_type) + r"\b", ui_text))
 has_raw_hook = bool(re.search(r"pub fn raw_input_hook\b", ui_text))
 if not re.search(r"\bServices\b|\bNoServices\b", construct) and "Services" not in ui_root and not spec:
     raise SystemExit(f"The UI crate does not visibly export Services; a custom adapter is required for {app}.")
+
+# figcraft's `Services::pick_*` methods return a future on newer source releases and a plain
+# Option on older ones. The recipe is written in the sync form, so rewrite it — and import the
+# future type — to whatever the checked-out trait declares; otherwise a regenerated launcher
+# cannot compile against the source it was generated from.
+if saf and app == "figcraft" and re.search(r"fn pick_open\([^)]*\)\s*->\s*DialogFuture", ui_root):
+    saf["imports"] += f"\nuse {ui_ident}::DialogFuture;"
+    saf["services"] = re.sub(
+        r"(fn pick_\w+\([^)]*\)) -> Option<[^>]*> \{\n(\s+)(.*?)\n\s*\}",
+        lambda m: (
+            f"{m.group(1)} -> DialogFuture {{\n"
+            f"{m.group(2)}let result = {m.group(3).strip()};\n"
+            f"{m.group(2)}Box::pin(async move {{ result }})\n"
+            f"{m.group(2)[:-4]}}}"
+        ),
+        saf["services"],
+        flags=re.S,
+    )
 
 # Prefer the app's own icon; don't accidentally bundle another ArtCraft app's branding.
 # An explicit -appicon always wins.
@@ -1464,7 +1818,7 @@ try:
         else:
             shutil.copy2(icon, out_dir / "ic_launcher.png")
 
-    serde_dep = 'serde_json = { workspace = true }\n' if saf else ''
+    serde_dep = 'serde_json = { workspace = true }\n' if (saf or _persist) else ''
     # The SAF bridge for rfd-driven apps (pdfcraft) calls `rfd::artcraft_saf` from the launcher, so
     # the launcher needs rfd as a direct dependency. The app's workspace patches it to the vendored
     # Android copy (see below), which carries the artcraft_saf module.
@@ -1481,6 +1835,9 @@ try:
     cpal_dep = "".join(f"{dep}\n" for dep in ('cpal = "0.16"', *AUDIO_MODULES[app][2])) if app in AUDIO_MODULES else ''
     java_sources = 'java_sources = "java"\n' if saf else ''
     config_changes = "orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|smallestScreenSize|density|layoutDirection|uiMode|fontScale|locale"
+    # Android open/share associations for the app's document types (the MAIN/LAUNCHER entry is always
+    # first). Shared with the adapter launchers; see lib/file_associations.py.
+    intent_filter_value = file_associations.intent_filter_toml(app)
     if saf:
         activity_block = f'''[[package.metadata.android.application.activity]]
 name = ".{saf['activity']}"
@@ -1490,9 +1847,10 @@ launch_mode = "singleTask"
 orientation = "sensor"
 exported = true
 # cargo-apk2 does NOT add a default MAIN/LAUNCHER filter when an activity is named, so declare it
-# here: without it the APK has no launcher activity and cannot start from the home screen. Keep it
-# inline: cargo-apk2's serde `flatten` rejects an `[[...activity.intent_filter]]` table.
-intent_filter = [{{ actions = ["android.intent.action.MAIN"], categories = ["android.intent.category.LAUNCHER"] }}]
+# here: without it the APK has no launcher activity and cannot start from the home screen. The
+# remaining filters register the app for its document types so the system can open/share them with
+# it. Keep it inline: cargo-apk2's serde `flatten` rejects an `[[...activity.intent_filter]]` table.
+intent_filter = {intent_filter_value}
 
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"
@@ -1505,6 +1863,7 @@ label = "{title}"
 launch_mode = "singleTask"
 orientation = "sensor"
 exported = true
+intent_filter = {intent_filter_value}
 '''
 
     package_name = packagename if packagename else f"ai.storyteller.{app}"
@@ -1580,6 +1939,13 @@ icon = "@mipmap/ic_launcher"
         (java_dir / f"{saf['activity']}.java").write_text(java_src)
 
     imports = []
+    # Pull in the shared Android system-font module (written next to our rust source below) so the
+    # launcher can fall back to the device's own fonts for scripts the app's fonts do not cover.
+    imports.append("mod system_fonts;")
+    # Pull in the shared Android soft-keyboard bridge (also written below) so the launcher can drain
+    # the Activity's IME events into egui. Its presence is also what keeps the vendored
+    # android-activity (which forwards show/hide to the Activity's imeShow/imeHide) in step.
+    imports.append("mod ime_bridge;")
     if re.search(r"\bSession\b", construct):
         imports.append(f"use {engine_ident}::Session;")
     services_syms = [s for s in ("NoServices", "Services") if re.search(r"\b" + s + r"\b", (SAF_RECIPES.get(app) or {}).get("construct_expr") or construct)]
@@ -1860,6 +2226,47 @@ fn android_clipboard_set(app: &AndroidApp, text: &str) {
     }
 '''
         saf_logic_poll = "        self.poll_file_picker();\n"
+        # Open documents the system handed us (ACTION_VIEW/ACTION_SEND). The Activity stages each
+        # file off the UI thread and queues its private path; wait a couple of frames so the app has
+        # finished its own start-up, then open one per frame exactly like a picked file.
+        intent_body = INTENT_OPEN.get(app, "")
+        if intent_body:
+            intent_method = f'''
+    fn open_incoming(&mut self, path: &str) {{
+        log::info!("Opening the file the system handed the app: {{path}}");
+{intent_body}    }}
+
+    /// Open any file the system handed the app (an intent it is registered for). Runs once per
+    /// staged file and is a no-op afterwards; a launcher without the intent host stops the poll.
+    fn poll_incoming_files(&mut self) {{
+        if self.intent_warmup > 0 {{
+            self.intent_warmup -= 1;
+            return;
+        }}
+        if self.intent_warmup < 0 {{
+            return;
+        }}
+        for _ in 0..16 {{
+            match self.saf_bridge.intent_poll() {{
+                Ok(Some(path)) => self.open_incoming(&path),
+                Ok(None) => break,
+                Err(error) => {{
+                    log::info!("Launcher does not report incoming files: {{error}}");
+                    self.intent_warmup = -1;
+                    break;
+                }}
+            }}
+        }}
+    }}
+'''
+            intent_logic = "        self.poll_incoming_files();\n"
+            intent_field = "\n    intent_warmup: i64,"
+            intent_init = ", intent_warmup: 2"
+        else:
+            intent_method = ""
+            intent_logic = ""
+            intent_field = ""
+            intent_init = ""
         saf_setup = saf.get("setup", "")
         post_construct = saf.get("post_construct", "")
         if "construct_expr" in saf:
@@ -1886,6 +2293,10 @@ fn android_clipboard_set(app: &AndroidApp, text: &str) {
         saf_setup = ""
         post_construct = ""
         inner_decl = "let inner"
+        intent_method = ""
+        intent_logic = ""
+        intent_field = ""
+        intent_init = ""
 
     shell = f'''
 /// On-device input diagnostics (reported through `adb logcat`).
@@ -1938,19 +2349,22 @@ impl InputProbe {{
     }}
 }}
 
+{persist_support}
 struct AndroidShell {{
     inner: {app_type},
     app: AndroidApp,
+    ime: ime_bridge::ime::ImeBridge,
     modifiers: egui::Modifiers,
     fullscreen_applied: bool,
-    probe: InputProbe,{saf_fields}
+    probe: InputProbe,{saf_fields}{intent_field}{persist_fields}
 }}
 
 impl AndroidShell {{
-    fn new(inner: {app_type}, app: AndroidApp{saf_new_params}) -> Self {{
-        Self {{ inner, app, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(){saf_new_init} }}
+    fn new(mut inner: {app_type}, app: AndroidApp{saf_new_params}) -> Self {{
+        {persist_new_body}let ime = ime_bridge::ime::ImeBridge::new(&app);
+        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(){saf_new_init}{intent_init}{persist_new_init} }}
     }}
-{saf_poll_method}
+{saf_poll_method}{intent_method}{persist_methods}
     /// Re-apply sticky immersive mode on the first frame and whenever the window regains focus
     /// (the system restores the bars after a gesture or when another activity closes).
     fn refresh_fullscreen(&mut self, raw: &egui::RawInput) {{
@@ -1995,21 +2409,23 @@ impl AndroidShell {{
 
 impl eframe::App for AndroidShell {{
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {{
-{saf_logic_poll}        {inner_logic}
+{intent_logic}{saf_logic_poll}{persist_logic}        {inner_logic}
     }}
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {{
+        system_fonts::install_system_fonts(ui.ctx());
         {inner_ui}
     }}
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {{
         self.probe.observe(raw);
+        self.ime.poll(raw);
         self.refresh_fullscreen(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         self.handle_clipboard_shortcuts(raw);
-        {inner_hook}
+{persist_hook}        {inner_hook}
     }}
-}}
+{persist_on_exit}}}
 '''
 
     # Install fonts before the first pass. Some apps (figcraft) lay out text with a named font family
@@ -2036,8 +2452,9 @@ impl eframe::App for AndroidShell {{
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: android_activity::AndroidApp) {{
-    log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}})", saf::SAF_MARKER);
+    log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}}, {{}})", saf::SAF_MARKER, ime_bridge::ime::IME_MARKER);
     apply_immersive_fullscreen(&android_app);
+{persist_env_call}    system_fonts::install_font_env(&android_app);
     let saf_bridge = saf::Bridge::new(&android_app);
     saf_bridge.request_storage_permission();
     let saf_state = saf_new_state();
@@ -2070,8 +2487,9 @@ fn android_main(android_app: android_activity::AndroidApp) {{
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: android_activity::AndroidApp) {{
-    log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready");
+    log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}})", ime_bridge::ime::IME_MARKER);
     apply_immersive_fullscreen(&android_app);
+{persist_env_call}    system_fonts::install_font_env(&android_app);
     let shell_app = android_app.clone();
     let options = eframe::NativeOptions {{
         viewport: egui::ViewportBuilder::default()
@@ -2093,6 +2511,11 @@ fn android_main(android_app: android_activity::AndroidApp) {{
 }}
 '''
     (staging_dir / "src").mkdir()
+
+    # The shared Android system-font module, referenced by `mod system_fonts;` in the entry above.
+    shutil.copy2(root / "templates" / "android" / "system_fonts.rs", staging_dir / "src" / "system_fonts.rs")
+    # The shared Android soft-keyboard bridge, referenced by `mod ime_bridge;` in the entry above.
+    shutil.copy2(root / "templates" / "android" / "ime_bridge.rs", staging_dir / "src" / "ime_bridge.rs")
 
     # Audio output on Android: the apps get their audio backend from the platform layer (cpal), and
     # their desktop modules are plain cpal code compiled straight from the app's own source into the
@@ -2244,10 +2667,13 @@ PY
 
 # The sync-picker ANR fix lives in android-activity's glue layer: while a blocking pick
 # parks the Rust main thread, JVM-thread lifecycle callbacks must not block on it (they
-# would be ANR'd by Android after ~5s). Only the builder-generated SAF bridge toggles that
-# mode (see templates/android/saf_bridge.rs), so only apps whose generated launcher
-# contains the bridge need the patched crate; the others keep the crates.io dependency.
-if grep -q 'ARTCRAFT_ANDROID_SAF_BRIDGE' "$ANDROID_DIR/src/lib.rs"; then
+# would be ANR'd by Android after ~5s). The builder's Android soft-keyboard bridge also
+# overrides android-activity's native `show_soft_input`/`hide_soft_input` so they drive the
+# Activity's own editable IME view (see templates/android/SafActivity.java) instead of the
+# unreliable decor-view call. Both fixes live in the vendored copy, so any launcher that uses
+# the SAF bridge (`ARTCRAFT_ANDROID_SAF_BRIDGE`) or the IME bridge (`mod ime_bridge`) needs it;
+# the others keep the crates.io dependency.
+if grep -qE 'ARTCRAFT_ANDROID_SAF_BRIDGE|mod ime_bridge' "$ANDROID_DIR/src/lib.rs"; then
     echo "Vendoring the ANR-safe android-activity glue for $TITLE..."
     rm -rf "$SRC/vendor/android-activity"
     cp -a "$ROOT/vendor/android-activity" "$SRC/vendor/android-activity"

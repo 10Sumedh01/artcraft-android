@@ -8,11 +8,21 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
+import android.text.InputType;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputConnectionWrapper;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -24,6 +34,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -51,6 +62,20 @@ public final class VectorCraftActivity extends NativeActivity {
     private final Map<Integer, Long> requestIds = new HashMap<>();
     private final Map<Long, String> suggestedNames = new HashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+
+    // Soft-keyboard host. A bare NativeActivity has no editable view, so the system IME opens
+    // unreliably and delivers no text. This tiny, invisible but focusable EditText has a real
+    // InputConnection, so the keyboard shows/dismisses on request and every commit/composition
+    // arrives here where imePoll() hands it to the Rust shell as egui IME events.
+    private final ConcurrentLinkedQueue<String> imeEvents = new ConcurrentLinkedQueue<>();
+    private EditText imeView;
+    // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
+    private volatile boolean imeWanted = false;
+
+    // Documents the system asked this app to open (an ACTION_VIEW/ACTION_SEND it is registered for):
+    // the private path of each staged copy, drained one per call by the Rust shell through
+    // intentPoll() and opened exactly like a file chosen in the picker.
+    private final ConcurrentLinkedQueue<String> intentPaths = new ConcurrentLinkedQueue<>();
 
     /** App-private storage root, used by the Rust shell for preferences and scratch data. */
     public String vcFilesDir() {
@@ -98,6 +123,18 @@ public final class VectorCraftActivity extends NativeActivity {
         if (window != null) {
             window.getDecorView().post(this::applyImmersiveFullscreen);
         }
+        imeSetup();
+        handleIncomingFiles(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        // singleTask launch mode: opening a registered file type while the app runs lands here
+        // instead of onCreate, so stage it for the shell the same way.
+        setIntent(intent);
+        applyImmersiveFullscreen();
+        handleIncomingFiles(intent);
     }
 
     @Override
@@ -106,6 +143,199 @@ public final class VectorCraftActivity extends NativeActivity {
         if (hasFocus) {
             applyImmersiveFullscreen();
         }
+    }
+
+    /**
+     * Install the invisible, focusable {@link EditText} that makes Android's soft keyboard usable.
+     * Called from {@link #onCreate}; failures are logged and leave the app on the old (unreliable)
+     * decor-view path, so a device that rejects the extra view still runs.
+     */
+    private void imeSetup() {
+        try {
+            // The IME height must not resize or pan the fullscreen native surface; the keyboard
+            // simply overlays it. STATE_UNCHANGED keeps the initial hidden state under our control.
+            Window window = getWindow();
+            if (window != null) {
+                window.setSoftInputMode(
+                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                                | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED);
+            }
+            imeView = new EditText(this) {
+                @Override
+                public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+                    InputConnection base = super.onCreateInputConnection(outAttrs);
+                    if (base == null) {
+                        return null;
+                    }
+                    return new InputConnectionWrapper(base, true) {
+                        @Override
+                        public boolean commitText(CharSequence text, int newCursorPosition) {
+                            if (text != null && text.length() > 0) {
+                                imeEvents.offer("c" + text);
+                            }
+                            return super.commitText(text, newCursorPosition);
+                        }
+
+                        @Override
+                        public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                            imeEvents.offer("p" + (text == null ? "" : text.toString()));
+                            return super.setComposingText(text, newCursorPosition);
+                        }
+
+                        @Override
+                        public boolean finishComposingText() {
+                            imeEvents.offer("f");
+                            return super.finishComposingText();
+                        }
+
+                        @Override
+                        public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+                            if (beforeLength > 0 || afterLength > 0) {
+                                imeEvents.offer("d" + beforeLength + "," + afterLength);
+                            }
+                            return super.deleteSurroundingText(beforeLength, afterLength);
+                        }
+
+                        @Override
+                        public boolean performEditorAction(int actionCode) {
+                            imeEvents.offer("a" + actionCode);
+                            return super.performEditorAction(actionCode);
+                        }
+
+                        @Override
+                        public boolean sendKeyEvent(KeyEvent event) {
+                            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                                int code = event.getKeyCode();
+                                if (code == KeyEvent.KEYCODE_DEL) {
+                                    imeEvents.offer("d1,0");
+                                } else if (code == KeyEvent.KEYCODE_FORWARD_DEL) {
+                                    imeEvents.offer("d0,1");
+                                } else if (code == KeyEvent.KEYCODE_ENTER) {
+                                    imeEvents.offer("a6");
+                                }
+                            }
+                            return super.sendKeyEvent(event);
+                        }
+                    };
+                }
+
+                @Override
+                public boolean onKeyDown(int keyCode, KeyEvent event) {
+                    // Let hardware key events fall through to the native input queue (winit), exactly
+                    // as they did before this view existed; the soft keyboard talks to us through the
+                    // InputConnection instead. This keeps physical keyboards working.
+                    return false;
+                }
+
+                @Override
+                public boolean onKeyUp(int keyCode, KeyEvent event) {
+                    return false;
+                }
+
+                @Override
+                public boolean onTouchEvent(android.view.MotionEvent event) {
+                    // Purely a keyboard target: never intercept touch, which belongs to the native
+                    // surface underneath.
+                    return false;
+                }
+            };
+            imeView.setBackground(null);
+            imeView.setCursorVisible(false);
+            imeView.setTextColor(0);
+            imeView.setAlpha(0.01f);
+            imeView.setSoundEffectsEnabled(false);
+            imeView.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+            imeView.setImeOptions(EditorInfo.IME_FLAG_NO_FULLSCREEN);
+            imeView.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
+            params.gravity = Gravity.TOP | Gravity.START;
+            addContentView(imeView, params);
+        } catch (Throwable error) {
+            Log.w(TAG, "Could not install the soft-keyboard host view", error);
+        }
+    }
+
+    /** Show the soft keyboard by focusing the IME host view. Called by the Rust shell via JNI. */
+    public void imeShow() {
+        final EditText view = imeView;
+        if (view == null) {
+            return;
+        }
+        imeWanted = true;
+        runOnUiThread(() -> {
+            if (!imeWanted) {
+                return;
+            }
+            try {
+                view.setFocusable(true);
+                view.setFocusableInTouchMode(true);
+                view.requestFocus();
+                InputMethodManager imm =
+                        (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                if (imm != null && imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)) {
+                    return;
+                }
+                // Some devices ignore the request until focus and layout have settled; retry once on
+                // the next message-loop turn (guarded so a following hide wins).
+                view.post(() -> {
+                    if (!imeWanted) {
+                        return;
+                    }
+                    try {
+                        InputMethodManager retry =
+                                (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                        if (retry != null) {
+                            retry.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT);
+                        }
+                    } catch (Throwable error) {
+                        Log.w(TAG, "Could not show the soft keyboard", error);
+                    }
+                });
+            } catch (Throwable error) {
+                Log.w(TAG, "Could not show the soft keyboard", error);
+            }
+        });
+    }
+
+    /** Hide the soft keyboard and release the IME host view. Called by the Rust shell via JNI. */
+    public void imeHide() {
+        imeWanted = false;
+        final EditText view = imeView;
+        if (view == null) {
+            return;
+        }
+        runOnUiThread(() -> {
+            try {
+                InputMethodManager imm =
+                        (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.hideSoftInputFromWindow(view.getWindowToken(), 0);
+                }
+                view.clearFocus();
+                // Drop the scratch buffer between sessions so it cannot grow without bound.
+                view.setText("");
+            } catch (Throwable error) {
+                Log.w(TAG, "Could not hide the soft keyboard", error);
+            }
+        });
+    }
+
+    /**
+     * Hand the Rust shell at most one queued keyboard event per call. The first character tags the
+     * event ("c" commit, "p" pre-edit, "f" finish, "d" delete-with-counts, "a" editor action) and
+     * the remainder is the payload; returns {@code null} when the queue is empty.
+     */
+    public String imePoll() {
+        return imeEvents.poll();
+    }
+
+    /**
+     * Hand the Rust shell the private path of one file the system asked us to open (or that another
+     * app shared with us), or {@code null} when nothing is queued. Each staged copy is delivered
+     * once and then opened exactly like a file chosen in the open picker.
+     */
+    public String intentPoll() {
+        return intentPaths.poll();
     }
 
     /** One queued picker result as JSON, or null; polled by the Rust shell every frame. */
@@ -343,6 +573,66 @@ public final class VectorCraftActivity extends NativeActivity {
             }
             out.flush();
         }
+    }
+
+    /**
+     * Collect the file(s) an {@code ACTION_VIEW} / {@code ACTION_SEND} intent carries: the data URI
+     * (opening a registered type), the intent's {@link ClipData} (modern shares) and the legacy
+     * {@code EXTRA_STREAM} extra, de-duplicated. Anything else (in particular the launcher's MAIN
+     * intent) is ignored so normal launches are untouched.
+     */
+    private static List<Uri> collectIncomingUris(Intent intent) {
+        LinkedHashSet<Uri> uris = new LinkedHashSet<>();
+        String action = intent.getAction();
+        if (Intent.ACTION_VIEW.equals(action)) {
+            if (intent.getData() != null) uris.add(intent.getData());
+        } else if (Intent.ACTION_SEND.equals(action)) {
+            Uri stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (stream != null) uris.add(stream);
+        } else if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+            ArrayList<Uri> streams = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (streams != null) uris.addAll(streams);
+        } else {
+            return new ArrayList<>();
+        }
+        ClipData clip = intent.getClipData();
+        if (clip != null) {
+            for (int i = 0; i < clip.getItemCount(); i++) {
+                Uri uri = clip.getItemAt(i).getUri();
+                if (uri != null) uris.add(uri);
+            }
+        }
+        return new ArrayList<>(uris);
+    }
+
+    /**
+     * Copy every file the given intent carries into app-private staging and queue its path for the
+     * Rust shell. Runs off the UI thread because the copy can be large; the shell polls
+     * {@link #intentPoll()} until the path appears, so a slow copy never blocks startup.
+     */
+    private void handleIncomingFiles(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        List<Uri> uris = collectIncomingUris(intent);
+        if (uris.isEmpty()) {
+            return;
+        }
+        for (Uri uri : uris) {
+            persistPermission(uri, intent);
+        }
+        io.execute(() -> {
+            for (Uri uri : uris) {
+                try {
+                    File stage = newStageFile(displayName(uri));
+                    copyUriToFile(uri, stage);
+                    rememberUri(stage, uri);
+                    intentPaths.offer(stage.getAbsolutePath());
+                } catch (Exception e) {
+                    Log.e(TAG, "Could not open the file the system handed the app: " + uri, e);
+                }
+            }
+        });
     }
 
     private JSONObject base(long id, String kind, String status) throws Exception {
