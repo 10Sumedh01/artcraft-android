@@ -332,7 +332,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "24"
+GENERATOR_VERSION = "26"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -1712,22 +1712,24 @@ fn persist_dir(app: &AndroidApp) -> Option<std::path::PathBuf> {
 
 /// Point the platform path helpers at app-private storage before the app reads them, so anything
 /// the app writes itself (autosave, recovery copies, caches) also lands there.
+///
+/// Only the settings and caches are set here, and only to the external app directory, so they stay
+/// reachable over USB. `HOME` and `XDG_DATA_HOME` are left to
+/// [`super::system_fonts::install_font_env`], which keeps them on internal storage: they are the
+/// roots the apps' font scanners read, and the symlinks to `/system/fonts` they need can only be
+/// created there (`/storage/emulated/0` refuses `symlink`).
 #[allow(unused_unsafe)]
 fn install_persist_env(app: &AndroidApp) {
     let Some(base) = app_data_dir(app) else { return };
     let config = base.join("config");
     let cache = base.join("cache");
-    let home = base.join("home");
     let _ = std::fs::create_dir_all(config.join(".config"));
     let _ = std::fs::create_dir_all(&cache);
-    let _ = std::fs::create_dir_all(&home);
     // SAFETY: `android_main` runs before the app starts any worker thread, so no other thread is
     // reading the environment here.
     unsafe {
         std::env::set_var("XDG_CONFIG_HOME", &config);
-        std::env::set_var("XDG_DATA_HOME", &base);
         std::env::set_var("XDG_CACHE_HOME", &cache);
-        std::env::set_var("HOME", &home);
     }
     log::info!("settings directory: {}", config.display());
 }

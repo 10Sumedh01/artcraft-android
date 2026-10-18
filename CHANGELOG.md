@@ -1,5 +1,42 @@
 # Changelog
 
+## v26 — 2026-10-18
+
+### Fixed
+- GridCraft's text renders in Arabic, Hebrew, CJK and the other non-Latin scripts. Every launcher
+  hands epaint the device's own faces (`/system/fonts`) as the last fallback of each active font
+  *family*, but the fallback was appended only to the families that existed on the pass it ran, and
+  a family born later was never given it: `Context::add_font` does nothing for a face whose key the
+  definition set already holds, so once the face was recorded it could no longer reach a family
+  introduced afterwards. Most apps draw with egui's default `Proportional` family, which exists from
+  the first pass and therefore got the fallback; GridCraft draws the interface and every cell with
+  its own named families (`FontFamily::Name("ui")`, `"cell"`, the per-workbook `fnt:…` roles), which
+  it binds in a `set_fonts` call applied on the *next* pass — after the fallback had already been
+  appended to the defaults. The shell now checks the fallback per family each frame and re-adds it
+  (under a fresh key) to any family still missing it, so a family bound at any point ends up with
+  the system faces as its lowest-priority entries. The change lives in the shared
+  `templates/android/system_fonts.rs`, which every launcher — generated and adapter — compiles.
+
+## v25 — 2026-10-18
+
+### Fixed
+- Arabic, Hebrew, Chinese/Japanese/Korean and the other non-Latin scripts render again. v23 moved the
+  *font environment* to the external app directory along with the app's data, but Android's emulated
+  external storage (`/storage/emulated/0/...`, a FUSE/sdcardfs mount) refuses `symlink`, so the links
+  that expose `/system/fonts` as `$HOME/.fonts`, `$HOME/.local/share/fonts` and `$XDG_DATA_HOME/fonts`
+  were never created — silently, because the failure is discarded. Every app whose font scanner reads
+  those directories (which is how the apps see any system face on Android, since `/usr/share/fonts`
+  does not exist there) found no font for a script its own embedded faces lack, and the interface and
+  documents showed blank boxes. Verified on device: the links were missing in every installed app, and
+  `symlink` succeeds under `/data/...` but fails with `Permission denied` under `/sdcard`.
+- The font environment is now built on **internal** storage, where the links can be made. Fonts are
+  not user data, so nothing user-visible moves: the settings/preferences/recent list keep living in
+  `.../Android/data/<pkg>/files/config` and the SAF working copies in `.../files/media`, both still
+  reachable over USB/MTP. Only `HOME` and `XDG_DATA_HOME` (the roots the font scanners read, plus
+  per-app dotfiles and fontconfig's cache) stay internal; `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` stay
+  external. The generated launchers and both adapters set `HOME`/`XDG_DATA_HOME` in one place
+  (`system_fonts::install_font_env`) so the two can no longer disagree about which storage they use.
+
 ## v24 — 2026-10-17
 
 ### Changed

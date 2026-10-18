@@ -93,9 +93,9 @@ A failed build is recorded under `logs/`. Use [`adapters/README.md`](adapters/RE
 
 ### Preferences and recovery files
 
-Each launcher persists the app's preferences under `config` in the app's private storage and restores them at startup. Platform path helpers such as `HOME` and `XDG_*` are pointed at the same location so that app-written autosave and recovery files are stored there as well.
+Each launcher persists the app's preferences under `config` in the app's private storage and restores them at startup. The path helpers an app writes through — `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and the app's own config folder — are pointed at the same location, so app-written autosave and recovery files are stored there as well. `HOME` and `XDG_DATA_HOME` are the one exception: they are the roots the font scanners read (see [System fonts](#system-fonts)) and stay on internal storage, the only place the links to `/system/fonts` can be created.
 
-That storage is the app-specific external directory, `/storage/emulated/0/Android/data/com.artcraft.<app>/files`, rather than the internal `/data/user/0/<pkg>/files`. External storage is reachable from a phone file manager and over USB/MTP, which makes settings, autosaves and exports findable; internal storage is invisible without root. The internal directory is used only as a fallback when external storage is unavailable. Android 11+ hides `Android/data` from the on-device document picker, so use USB/MTP or `adb` to browse it.
+That storage is the app-specific external directory, `/storage/emulated/0/Android/data/com.artcraft.<app>/files`, rather than the internal `/data/user/0/<pkg>/files`. External storage is reachable from a phone file manager and over USB/MTP, which makes settings, autosaves and exports findable; internal storage is invisible without root. The internal directory is the fallback when external storage is unavailable (and is always used for the font environment, which needs links external storage cannot hold). Android 11+ hides `Android/data` from the on-device document picker, so use USB/MTP or `adb` to browse it.
 
 A document opened through Storage Access Framework (SAF) is staged as `<files>/media/<document name>`, so the working copy the app edits is easy to find and the same document always maps to the same path. If that name is already taken by another document, a ` (2)`-style suffix is added rather than sharing the file (a name whose staged copy has since been deleted is free again — no suffix for a cleared document that comes back). When the app lets go of a document — the recent list is cleared, an entry is removed, or the capped list ages it out — and no open document shows it, its staged copy under `media/` is deleted; the original still lives at its SAF location, and the `uri:` mapping is kept so re-opening it reuses the same path. A one-time sweep, half a minute after start, also clears out staged copies that nothing refers to any more (leftovers from an older session or a crash).
 
@@ -103,13 +103,13 @@ PhotoCraft and VectorCraft save through their adapters, which use the same exter
 
 ### System fonts
 
-The launcher uses Android's system fonts alongside each app's embedded fonts. It installs device font faces under `/system/fonts` and `/product/fonts` as lower-priority egui fallbacks, then links the font directory into the user font locations read by app-level scanners:
+The launcher uses Android's system fonts alongside each app's embedded fonts. It installs device font faces under `/system/fonts` and `/product/fonts` as the lowest-priority entry of **every** egui font family an app binds — re-checked each frame, so a family an app creates later (GridCraft draws with its own named `ui`/`cell`/`fnt:…` families rather than egui's default `Proportional`) still receives the fallback. It then links the font directory into the user font locations read by app-level scanners:
 
 - `$HOME/.fonts`
 - `$HOME/.local/share/fonts`
 - `$XDG_DATA_HOME/fonts`
 
-A minimal `fonts.conf` provides the font configuration. This supports scripts including CJK, Arabic, Hebrew, Indic scripts, Thai, Khmer, and Myanmar when suitable fonts are present on the device. Existing app rendering is left unchanged where the app already has glyph coverage. Exact coverage depends on the fonts included by the device manufacturer.
+A minimal `fonts.conf` provides the font configuration. The links and that file live in the **internal** private directory (`/data/user/0/<pkg>/files`), not the external one: Android's emulated external storage refuses `symlink`, so building them there leaves `$HOME/.fonts` and friends missing and the scanners find no system face — the reason non-Latin scripts broke under v23. `HOME` and `XDG_DATA_HOME` therefore point at the internal directory even though the rest of the app's data is external. This supports scripts including CJK, Arabic, Hebrew, Indic scripts, Thai, Khmer, and Myanmar when suitable fonts are present on the device. Existing app rendering is left unchanged where the app already has glyph coverage. Exact coverage depends on the fonts included by the device manufacturer.
 
 ### Soft keyboard and text input
 

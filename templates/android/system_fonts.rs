@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Directories Android keeps its system fonts in, in the order they are preferred.
@@ -240,63 +241,88 @@ const SYSTEM_SCRIPTS: &[SystemScript] = &[
     },
 ];
 
-/// Install any missing system fallbacks into the active font families.
+/// Whether `key` names one of our system faces for `script`: `script.key` itself, or a later
+/// generation `script.key#n` (see [`install_system_fonts`]).
+fn is_our_face(key: &str, script: &SystemScript) -> bool {
+    key == script.key || key.strip_prefix(script.key).is_some_and(|rest| rest.starts_with('#'))
+}
+
+/// Bumped each time our faces are re-appended for families that appeared after the last install, so
+/// the same face can be added again under a fresh key (`Context::add_font` skips a key it already
+/// holds, which is exactly what would keep a family born later from ever receiving the fallback).
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Install any missing system fallbacks into every active font family.
 ///
-/// Called from the app's `ui` (inside an egui pass, where fonts exist) each frame: it is a cheap
-/// lookup when the fonts are already present, and re-installs them after an app's `set_fonts`
-/// replaces the font definitions.
+/// Called from the app's `ui` (inside an egui pass, where fonts exist) each frame: it is one cheap
+/// lookup per family when everything is already in place, and it *repairs* the definition set after
+/// an app replaces it wholesale (`Context::set_fonts`).
+///
+/// Presence in `font_data` is *not* enough to decide there is nothing to do. An app that draws with
+/// its own families (`FontFamily::Name("cell-…")`, as GridCraft does) builds them in a `set_fonts`
+/// call whose definitions are applied on the *next* pass, so our faces are first appended to the
+/// families that already existed and `Context::add_font` then refuses to re-add them to the
+/// families that appear afterwards — leaving every non-Latin glyph drawn in those families a blank
+/// box. We therefore check *coverage per family* and, when one is missing a face, append it under a
+/// fresh generation key. Generations share the same borrowed font bytes, and a key no family
+/// references is never rasterized, so this costs no measurable memory.
 pub fn install_system_fonts(ctx: &egui::Context) {
-    // Which of our faces the active definitions already carry.
-    let installed: Vec<bool> = ctx.fonts(|view| {
-        let data = &view.definitions().font_data;
-        SYSTEM_SCRIPTS
+    // The families bound this pass, and, per script, those whose chain carries none of our faces.
+    let (families, missing) = ctx.fonts(|view| {
+        let definitions = view.definitions();
+        let families: Vec<egui::FontFamily> = view.families();
+        let missing: Vec<Vec<usize>> = SYSTEM_SCRIPTS
             .iter()
-            .map(|script| data.contains_key(script.key))
-            .collect()
+            .map(|script| {
+                families
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, family)| {
+                        !definitions
+                            .families
+                            .get(*family)
+                            .is_some_and(|chain| chain.iter().any(|key| is_our_face(key, script)))
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .collect();
+        (families, missing)
     });
-    if installed.iter().all(|present| *present) {
+    if families.is_empty() || missing.iter().all(Vec::is_empty) {
         return;
     }
 
-    // Append as the last fallback of every family, so app fonts always win and only glyphs they
-    // lack are taken from the system face.
-    let families: Vec<egui::FontFamily> = ctx.fonts(|view| view.families());
-    if families.is_empty() {
-        return;
-    }
-    let family_count = families.len();
-    // The probe has to be drawn from a family that is actually bound, or epaint panics; prefer the
-    // default UI family but fall back to whatever the app does define.
-    let probe_family = families
-        .iter()
-        .find(|family| matches!(family, egui::FontFamily::Proportional))
-        .cloned()
-        .unwrap_or_else(|| families[0].clone());
-    let font_id = egui::FontId::new(14.0, probe_family);
-    for (script, present) in SYSTEM_SCRIPTS.iter().zip(&installed) {
-        if *present {
-            continue;
-        }
-        // Another face already draws this script (the app installed its own system font, or an
-        // earlier fallback of ours covers it): leave it alone.
-        if ctx.fonts_mut(|view| view.has_glyph(&font_id, script.probe)) {
+    let mut added = false;
+    for (script, missing) in SYSTEM_SCRIPTS.iter().zip(&missing) {
+        if missing.is_empty() {
             continue;
         }
         let Some(data) = script_font(script) else { continue };
-        let inserts = families
+        // Append as the last fallback, so an app's own faces always win and only glyphs they lack
+        // come from the system face.
+        let inserts = missing
             .iter()
-            .cloned()
-            .map(|family| egui::epaint::text::InsertFontFamily {
-                family,
+            .map(|&index| egui::epaint::text::InsertFontFamily {
+                family: families[index].clone(),
                 priority: egui::epaint::text::FontPriority::Lowest,
             })
             .collect();
-        ctx.add_font(egui::epaint::text::FontInsert::new(script.key, data, inserts));
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        let key = format!("{}#{generation}", script.key);
+        ctx.add_font(egui::epaint::text::FontInsert::new(&key, data, inserts));
         log::info!(
-            "Android: installed system fallback font {} (U+{:04X}) into {family_count} families",
+            "Android: added system fallback font {} (U+{:04X}) to {} families that lacked it",
             script.key,
-            script.probe as u32
+            script.probe as u32,
+            missing.len()
         );
+        added = true;
+    }
+    if added {
+        // `add_font` only queues the change; egui applies it at the start of the next pass, so ask
+        // for that pass rather than waiting for the next input event.
+        ctx.request_repaint();
     }
 }
 
@@ -400,10 +426,15 @@ fn font_face_count(bytes: &[u8]) -> u32 {
 /// the XDG data directory (`$XDG_DATA_HOME/fonts`), none of which exist on Android. Symlinking the
 /// system font folder in under those names — and writing a minimal `fonts.conf` for the fontconfig
 /// readers — is enough for the existing scanners, without editing any app.
+///
+/// The links can only be created on **internal** storage: Android's emulated external storage
+/// (`/storage/emulated/0/...`, a FUSE/sdcardfs mount) refuses `symlink` with `EPERM`. Creating them
+/// under the external app directory therefore left `$HOME/.fonts` and friends missing, and the
+/// scanners found no system face for Arabic, Hebrew, CJK and the other non-Latin scripts (blank
+/// boxes). Fonts are not user data, so this environment stays in the internal private directory even
+/// though the settings, working copies and exports live on external storage.
 pub fn install_font_env(app: &android_activity::AndroidApp) {
-    // Prefer the app-specific external directory (`.../Android/data/<pkg>/files`) so the fontconfig
-    // cache and any generated font data stay reachable over USB, and fall back to internal storage.
-    let Some(base) = app.external_data_path().or_else(|| app.internal_data_path()) else { return };
+    let Some(base) = app.internal_data_path() else { return };
     let home = base.join("home");
     let _ = std::fs::create_dir_all(home.join(".local/share"));
 
@@ -436,16 +467,14 @@ pub fn install_font_env(app: &android_activity::AndroidApp) {
     }
 
     // SAFETY: `android_main` runs before the app starts any worker thread, so no other thread is
-    // reading the environment here. `HOME`/`XDG_DATA_HOME` are only set when absent, so a launcher
-    // that already chose its own layout (the persistence shell) keeps it.
+    // reading the environment here. `HOME`/`XDG_DATA_HOME` are the roots the apps' font scanners
+    // read, so they are pointed at the internal links above *unconditionally*: the app-data redirect
+    // (`install_persist_env`) may already have chosen external storage for the settings and caches,
+    // and external storage cannot hold these links.
     #[allow(unused_unsafe)]
     unsafe {
-        if std::env::var_os("HOME").is_none() {
-            std::env::set_var("HOME", &home);
-        }
-        if std::env::var_os("XDG_DATA_HOME").is_none() {
-            std::env::set_var("XDG_DATA_HOME", &base);
-        }
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", &base);
         std::env::set_var("FONTCONFIG_FILE", &conf);
         std::env::set_var("FONTCONFIG_PATH", &conf_dir);
     }
