@@ -64,7 +64,7 @@ bash build.sh -photocraft \
 | --- | --- |
 | `output/<app>-<version>.apk` | Optimized release APK, versioned from the app's own source manifest (e.g. `output/vectorcraft-0.12.0.apk`) |
 | `output/<app>-<version>-debug.apk` | Debug APK |
-| `source/<app>/` | Source checkout and generated NativeActivity crate |
+| `source/<app>/` | Source checkout and generated GameActivity crate |
 | `build/<app>/target/` | Isolated Cargo build output for the app |
 | `logs/` | Build logs for diagnosis |
 | `keys/artcraft-builder.jks` | Persistent local signing keystore |
@@ -76,6 +76,14 @@ Build output is separated by app so that Cargo artifacts and source changes do n
 The builder is designed to preserve local work. It does not delete an existing source checkout, reset it, or pull over local changes. Subsequent builds reuse the existing checkout and any modifications made to the Android port.
 
 Update app sources deliberately with Git after preserving your changes. Review the diff before switching versions or incorporating upstream changes.
+
+## Build pipeline
+
+Each build compiles the app's Rust code with [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) into a `jniLibs` tree and packages it with the Gradle Android Plugin (AGP 8.7.3 on the bundled Gradle 8.11.1 wrapper). The launcher runs as a GameActivity — Google's maintained Activity for native apps, whose Java half also hosts the soft keyboard input connection — so the APK's Java side links `androidx.games:games-activity` and AppCompat alongside the platform SDK.
+
+The Gradle project, `AndroidManifest.xml` and the `Theme.AppCompat` theme are regenerated from the app's own Cargo metadata on every build (see `lib/android_project.py`). Signing uses the persistent builder keystore (`keys/artcraft-builder.jks`) through Gradle's signing configs, and `versionCode` follows the same formula as earlier toolchains, so update installs stay compatible.
+
+Gradle needs a JDK in the 17–23 range. The builder uses the first one it finds on the machine and, when there is none, downloads Temurin JDK 21 into `.cache/jdk/` once. The signing keystore itself keeps being created with the system `keytool`.
 
 ## Porting model and adapter boundary
 
@@ -116,6 +124,30 @@ A minimal `fonts.conf` provides the font configuration. The links and that file 
 The Android soft keyboard is wired into every app. Each Activity installs an invisible, focusable `EditText`; its `InputConnection` controls keyboard visibility and forwards text commits, composition updates, deletions, and Enter to the Rust shell. The shell converts these into egui input-method events for the currently focused text field.
 
 The keyboard overlays the fullscreen native surface rather than resizing it.
+
+### Edge-to-edge display
+
+Every app draws under the status and navigation bars, with the bars transparent and their icons (clock, battery, navigation) matched to the app's current light or dark theme — switched per frame, so a light document never sits under white-on-white status icons, on Android 9 and 10 included. Selection handles and the long-press toolbar are suppressed over the native surface, where they otherwise appear on every touch with no text field to belong to.
+
+### Launcher icons
+
+Every app ships a proper adaptive launcher icon: the app's brand colour as a solid background layer, the artwork (its solid background flood-filled away, so the silhouette is the artwork itself) as the foreground inside the launcher's visible safe zone, and the same artwork as the `<monochrome>` layer Android 13+ uses for Material You themed icons — instead of tinting a whole flat square the way a plain PNG does. The flat density icons remain for file managers and other non-adaptive surfaces. The artwork comes from the app's own vector icon where it has one, otherwise its largest own PNG; a `-appicon` override goes through the same pipeline. Both adapters get the identical treatment from the same shared generator (`lib/app_icons.py`).
+
+### Light and dark theme
+
+Apps follow the phone's own appearance setting — opened in dark mode, the interface is dark from the first frame, and switching the phone to light or dark while the app runs re-themes it live, system-bar icons included (the Android side of what the web builds read from `prefers-color-scheme`). The in-app Appearance setting still lets you pin light or dark explicitly; system is its default.
+
+### Mouse and trackpad
+
+A connected mouse or trackpad gets hover, scroll wheel, and secondary click (the interface's context menu).
+
+### Drag and drop
+
+Files can be dragged out of the Files app (or a browser) and dropped onto the window — handy in split-screen next to another app. A dropped file is copied into app-private storage off the UI thread and opens through the same path a file shared through the share sheet uses. Persistable read access is requested when the source offers it, since drag grants are otherwise temporary.
+
+### Printing
+
+WordCraft prints through Android's native print system: the print flow offers the system print dialog, which reaches every printer the device knows — Wi-Fi, network, and cloud print services — with printer, paper size, duplex, color, and page range chosen in the dialog itself (Android keeps printer enumeration there; apps cannot list printers). The app's page range, copies, and collation are already applied to the PDF it generates, and the system spooler receives that PDF unchanged. Job feedback — submitted or failed — appears where the desktop spooler's would.
 
 ### Open-with and share-sheet integration
 

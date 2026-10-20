@@ -22,7 +22,12 @@ pub use winit;
 
 pub mod clipboard;
 mod dropped_file;
+#[cfg(target_os = "android")]
+pub mod android_activity;
+pub mod open_url;
+mod pointer_icon;
 mod safe_area;
+mod system_theme;
 mod window_settings;
 
 pub use window_settings::WindowSettings;
@@ -265,6 +270,16 @@ impl State {
         profiling::function_scope!();
 
         self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
+
+        // Android's winit backend never emits `ThemeChanged`, so the OS light/dark state
+        // reaches egui through a direct read of the Activity's configuration instead —
+        // `RawInput::system_theme`, the same field the desktop path fills (see
+        // `system_theme`). Set every frame; egui resolves `ThemePreference::System`
+        // against it and only re-themes when the value actually changes.
+        #[cfg(target_os = "android")]
+        {
+            self.egui_input.system_theme = crate::system_theme::system_theme();
+        }
 
         // On Windows, a minimized window will have 0 width and height.
         // See: https://github.com/rust-windowing/winit/issues/208
@@ -1296,6 +1311,15 @@ impl State {
         } else {
             window.set_cursor_visible(false);
         }
+
+        // winit's Android `set_cursor` is a no-op, so the icon the interface resolved above
+        // never reaches the screen: a mouse keeps Android's default arrow over text, buttons,
+        // and splitters alike. Forward it to the Activity's surface view as a system pointer
+        // icon instead. This runs only when the icon really changed (the dedupe above returns
+        // early otherwise), so a still pointer costs no JNI traffic at all. (`None` icons are
+        // excluded by `pointer_icon_type` itself.)
+        #[cfg(target_os = "android")]
+        crate::pointer_icon::apply(cursor_icon);
     }
 }
 
@@ -1399,15 +1423,26 @@ pub fn update_viewport_info(
     viewport_info.focused = Some(window.has_focus());
 }
 
-fn open_url_in_browser(_url: &str) {
-    #[cfg(feature = "webbrowser")]
-    if let Err(err) = webbrowser::open(_url) {
-        log::warn!("Failed to open url: {err}");
+fn open_url_in_browser(url: &str) {
+    // Android has no usable `webbrowser` here (the `links` feature is off for the ArtCraft apps),
+    // so open the URL with an `ACTION_VIEW` intent instead — see `open_url`.
+    #[cfg(target_os = "android")]
+    {
+        crate::open_url::open_url(url);
+        return;
     }
 
-    #[cfg(not(feature = "webbrowser"))]
+    #[cfg(not(target_os = "android"))]
     {
-        log::warn!("Cannot open url - feature \"links\" not enabled.");
+        #[cfg(feature = "webbrowser")]
+        if let Err(err) = webbrowser::open(url) {
+            log::warn!("Failed to open url: {err}");
+        }
+
+        #[cfg(not(feature = "webbrowser"))]
+        {
+            log::warn!("Cannot open url - feature \"links\" not enabled.");
+        }
     }
 }
 

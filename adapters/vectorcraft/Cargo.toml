@@ -10,14 +10,15 @@ crate-type = ["cdylib"]
 [dependencies]
 vectorcraft-engine = { path = "../../crates/engine" }
 vectorcraft-ui-egui = { path = "../../crates/ui-egui" }
-eframe = { workspace = true, features = ["wgpu", "persistence"] }
+eframe = { workspace = true, features = ["wgpu", "persistence", "android-game-activity"] }
 egui = { workspace = true }
+egui-winit = "0.36"
 log = { workspace = true }
 serde_json = { workspace = true }
 jni = "0.22"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-activity = { version = "0.6", default-features = false, features = ["native-activity"] }
+android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
 
 [package.metadata.android]
 package = "com.artcraft.vectorcraft"
@@ -32,19 +33,20 @@ target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "VectorCraft"
-theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+# GameActivity extends AppCompatActivity, which refuses to inflate under a framework-only
+# theme; the builder generates res/values/themes.xml with this style (AppCompat parent).
+theme = "@style/Theme.Artcraft"
 icon = "@mipmap/ic_launcher"
 
 [[package.metadata.android.application.activity]]
 name = ".VectorCraftActivity"
-config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|layoutDirection"
+config_changes = "orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|smallestScreenSize|density|layoutDirection|uiMode|fontScale|locale"
 label = "VectorCraft"
 launch_mode = "singleTask"
 orientation = "sensor"
 exported = true
-# cargo-apk2 does NOT add a default MAIN/LAUNCHER filter when an activity is named, so declare it
-# here: without it the APK has no launcher activity and cannot be started from the home screen.
-# Keep it inline: cargo-apk2's serde `flatten` rejects an `[[...activity.intent_filter]]` table.
+# The MAIN/LAUNCHER filter that gives the APK a launcher icon; lib/file_associations.py may
+# append VIEW/SEND filters for the app's document types by rewriting this single line.
 intent_filter = [{ actions = ["android.intent.action.MAIN"], categories = ["android.intent.category.LAUNCHER"] }]
 
 [[package.metadata.android.application.activity.meta_data]]

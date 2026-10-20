@@ -432,6 +432,25 @@ pub struct AndroidAppInner {
     app_asset_manager: AssetManager,
 }
 
+/// While non-zero, `android_native_app_glue.c`'s JVM-thread callbacks deliver their command
+/// through the message pipe and return without waiting for the Rust main thread -- which a
+/// blocking (SAF) file pick can park for as long as the picker stays open; waiting it out
+/// would stall the Java main thread past Android's ~5 s ANR threshold. Mirrors the
+/// native-activity glue's `CALLBACKS_NONBLOCKING` (whose counterpart drives the same
+/// `extern int` in the C glue -- `AtomicI32` is layout-compatible with `int`, and the C
+/// side's plain read of a rarely-flipped flag degrading to a stale value only selects the
+/// conservative bounded wait).
+#[no_mangle]
+pub static ARTCRAFT_NONBLOCKING_CALLBACKS: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
+
+/// Enable or disable the non-blocking JNI callbacks (see
+/// [`ARTCRAFT_NONBLOCKING_CALLBACKS`]); the SAF bridge's guard flips this on around a
+/// blocking pick and back off afterwards.
+pub fn set_nonblocking_callbacks(nonblocking: bool) {
+    ARTCRAFT_NONBLOCKING_CALLBACKS.store(nonblocking as i32, core::sync::atomic::Ordering::SeqCst);
+}
+
 impl AndroidAppInner {
     pub fn activity_as_ptr(&self) -> *mut c_void {
         // Note: The global reference in `android_app` is only guaranteed to be
@@ -670,6 +689,26 @@ impl AndroidAppInner {
 
     // TODO: move into a trait
     pub fn show_soft_input(&self, show_implicit: bool) {
+        // Prefer the Activity's own IME host view when it provides one (the same preference
+        // the native-activity backend applies): a bare activity has no editable view, so the
+        // stock call never delivers text; the generated Activity focuses a real editable
+        // imeShow() host instead. Activities without it fall through to the stock path.
+        let ime_host = self
+            .jvm
+            .attach_current_thread(|env| -> jni::errors::Result<bool> {
+                if env
+                    .call_method(&*self.activity, jni::jni_str!("imeShow"), jni::jni_sig!("()V"), &[])
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
+                let _ = env.exception_clear();
+                Ok(false)
+            })
+            .unwrap_or(false);
+        if ime_host {
+            return;
+        }
         self.game_activity.with_locked_app(|app_ptr| {
             if app_ptr.is_null() {
                 log::error!("Attempted to show soft input after GameActivity was destroyed");
@@ -689,6 +728,24 @@ impl AndroidAppInner {
 
     // TODO: move into a trait
     pub fn hide_soft_input(&self, hide_implicit_only: bool) {
+        // Mirror of show_soft_input's imeShow preference: the generated Activity's
+        // imeHide() retracts the editable host it owns; anything else falls through.
+        let ime_host = self
+            .jvm
+            .attach_current_thread(|env| -> jni::errors::Result<bool> {
+                if env
+                    .call_method(&*self.activity, jni::jni_str!("imeHide"), jni::jni_sig!("()V"), &[])
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
+                let _ = env.exception_clear();
+                Ok(false)
+            })
+            .unwrap_or(false);
+        if ime_host {
+            return;
+        }
         self.game_activity.with_locked_app(|app_ptr| {
             if app_ptr.is_null() {
                 log::error!("Attempted to hide soft input after GameActivity was destroyed");

@@ -1,5 +1,285 @@
 # Changelog
 
+## v37 — 2026-10-20
+
+### Added (in progress — hover not yet reaching winit)
+- An Android pointer-icon bridge in the vendored `egui-winit`: `pointer_icon.rs` translates the
+  `egui::CursorIcon` the interface resolves each frame into an `android.view.PointerIcon` and
+  pushes it to the Activity's `InputEnabledSurfaceView` over JNI, so a mouse could show the
+  native I-beam over text, a pointing hand over buttons, and resize arrows over splitters.
+  winit's Android `set_cursor` is a no-op, so without this the icon never reaches the screen.
+  The Activity handle is published once by each launcher (`android_activity.rs`) because
+  `ndk-context` only carries the *Application*, and `Activity.getWindow()`/`startActivity()` are
+  Activity-only. Verified on-device: the bridge runs and sets the icon on the surface view.
+- A native link opener in the vendored `egui-winit`: `open_url.rs` opens a URL with an
+  `ACTION_VIEW` intent on the Activity. egui's link widgets emit an `OpenUrl` command that
+  `egui-winit` forwards to `webbrowser::open`, but that is compiled only under the `links`
+  feature, which the ArtCraft apps leave off — so on Android a clicked link did nothing. The
+  app's own `open_url` service is likewise unset on Android, so every link path ends here.
+
+### Fixed
+- EffectCraft could not import or export at all: every import said "media import is not available in
+  this build" and every export "export is not available in this build". The generated launcher
+  started a bare `Session::new()`, which has no media importer, no Render Queue exporter, no
+  expression engine and no scripting; the desktop app instead builds `effectcraft_host::session()`.
+  The launcher now depends on `effectcraft-host` and constructs `EffectcraftApp::new(
+  effectcraft_host::session())`, so its import and export paths work. `effectcraft-host` compiles
+  for `aarch64-linux-android`; the APK grows (64 MB → 87 MB) because the media decoders and the
+  export encoders are now linked in. (This was mis-diagnosed earlier as a blocking-picker ANR; the
+  picker itself was fine — the staged file even landed in `media/` — but the session had nothing to
+  import it with.)
+- SoundCraft's launcher icon came out as a white background with a nearly all-black bird, instead
+  of the white bird on teal it should be. Two bugs in `lib/app_icons.py` combined. (1) Its
+  `icon.svg` draws the artwork inside a rounded-square clip (transparent corners), and `magick` was
+  rasterising the SVG onto an opaque white canvas: those corners came back white, which then won the
+  brand-colour vote, so the adaptive background layer was generated `#FFFFFF` and the legacy mipmaps
+  carried white corner wedges; `_raster`/`_write_legacy` now pass `-background none`. (2) The
+  adaptive foreground is the artwork with its background flood-filled away, seeded at the image
+  edges — but SoundCraft's bird runs off the bottom and right edges (its paths reach `520,520` and
+  `530,540`, past the 512 viewBox), so the flood reached the *cream body* and erased it, leaving only
+  the dark outline. `_strip_background` now identifies the background colour (the most common opaque
+  border colour) and clears a flooded pixel only when it actually *was* that colour, so a flood that
+  bleeds into edge-touching artwork leaves the artwork intact. Result: background `#14A9C4`, a cream
+  `#EFE9DC` bird on it, and transparent legacy corners. Other apps are unchanged (their artwork does
+  not touch the edge); the white-corner fix still applies to every rounded-square icon.
+
+### Known gap
+- The pointer icon still does not change on a real mouse hover. `apply_cursor` (and
+  `on_cursor_moved`) are never reached, so hover is not arriving at winit even though the
+  Activity's window receives it (the framework logs `updatePointerIcon`). GameActivity attaches
+  an `OnGenericMotionListener` to the `InputEnabledSurfaceView`, but the view appears not to
+  receive hover; to be continued.
+
+## v36 — 2026-10-19
+
+### Fixed
+- The API-33 guard on `AMotionEvent_getActionButton` is back in the vendored
+  `android-activity` crate. It had been reverted to the committed crate during the mouse
+  input rollback, which restored the direct `ndk_sys` reference to a function Android only
+  added in 13 — so native-activity builds again died at launch on Android 12L and below with
+  `cannot locate symbol "AMotionEvent_getActionButton"` (the report came from gridcraft,
+  0.8.0). The call is resolved once through `libc::dlsym` against `RTLD_DEFAULT` and cached
+  in a `OnceLock`; a device without the symbol reports an unknown button, exactly as the
+  v33 fix behaved. GameActivity builds never read the symbol (the button arrives from the
+  Java event), so nothing changes there.
+
+### Changed
+- One more mouse-wheel fix, in the other backend: the GameActivity pointer struct only
+  carries the axes the app asks for, and only X/Y are on by default, so the scroll wheels
+  read as zero and no `MouseWheel` was ever emitted. `EventLoop::new` now enables
+  `Axis::Vscroll` and `Axis::Hscroll` before the loop starts (lock-safe, unlike a call from
+  inside the event callback), which restores wheel scrolling.
+- Rebuilt gridcraft, photocraft, vectorcraft and designcraft. All four launch cold with no
+  `UnsatisfiedLinkError`, and `readelf` finds zero references to `AMotionEvent_getActionButton`
+  in the shipped libraries.
+
+## v35 — 2026-10-19
+
+### Fixed
+- The nine apps that had not been rebuilt since the v33 symbol fix still refused to start on
+  Android 12L and below, dying at launch with "cannot locate symbol
+  AMotionEvent_getActionButton". Their shipped APKs predated the guard (and, on those trees,
+  the GameActivity migration), so lifting them onto the current builder was the whole fix —
+  every build re-vendors the patched `android-activity` crate fresh. All nine, plus the four
+  already-current gate apps rebuilt in the same pass, now carry **zero** references to the
+  symbol, checked with `readelf` against the libraries inside the shipped APKs.
+
+### Restored
+- Pointer-icon support is back — the v34 removal is undone — now living in the shared vendored
+  `egui-winit`, which is where the hook always belonged: each build vendors that one crate, so
+  a per-app copy is just a build artifact the next build overwrites, which is exactly how the
+  five wired copies were quietly dropped in the first place. A mouse or trackpad over any app
+  again gets the interface's cursor shape (text I-beam over text, resize arrows on an edge,
+  grabbing hand while dragging, and so on). Every app was rebuilt with it, so all thirteen
+  APKs carry the bridge.
+
+## v34 — 2026-10-19
+
+### Fixed
+- Light/dark following never worked on a device. v31's per-frame poll reads
+  `Configuration.uiMode`, which is a Java **`int`**, but the JNI field lookup asked for a
+  `byte` — so `GetFieldID` failed with `NoSuchFieldError` on every frame and the theme read
+  always came back `None`, leaving the interface on its start-up theme. The field is now read
+  with its real signature (`I`), so an app opened in dark mode is dark from the first frame,
+  and switching the phone's appearance while the app runs re-themes it live.
+- PhotoCraft's canvas fell back to the CPU compositor and Help › System Info reported no
+  adapter ("unknown"). The adapter never handed eframe's render state to the app. It now
+  requests the GPU renderer explicitly (Vulkan first, GLES as fallback), widens the device to
+  the adapter's own texture and buffer limits like the desktop build, records the adapter for
+  System Info, and starts the wgpu canvas — a device that reports a CPU adapter still falls
+  back honestly.
+
+### Removed
+- The pointer-icon experiment (forwarding egui's cursor shape to Android's system pointer
+  icon over JNI). It had already been dropped from the shared vendored `egui-winit`, but the
+  five app trees vendored while it lived (vectorcraft, lightcraft, effectcraft, designcraft,
+  soundcraft) still carried it wired — those copies are back to the committed crate, and the
+  duplicated empty "Mouse and trackpad" heading it left in the README is gone too.
+  *(Reverted in v35: the hook now sits in the shared vendored crate, so no build can drop it
+  again.)*
+
+## v33 — 2026-10-19
+
+### Fixed
+- The apps no longer refuse to start on Android 12L and below, dying at launch with a
+  "cannot locate symbol AMotionEvent_getActionButton" link error. The mouse/scroll input
+  path reads the button a press or release refers to through the NDK function
+  `AMotionEvent_getActionButton`, which Android only added in API 33 (Android 13). The
+  direct reference kept that symbol in the library's dynamic table, so on every older
+  device the dynamic linker refused to load the whole app before a single frame was
+  drawn. The call is now resolved once through `dlsym` — the same way the platform
+  resolves it — and devices without it report an unknown button: no button identity was
+  reported there before either (the field cannot exist on those versions), so click
+  handling behaves exactly as it did, and every other input field keeps working.
+  GameActivity builds were never affected — that backend receives the button from the
+  Java event, which exists since API 23 — but the guard covers the vendored
+  android-activity crate's native-activity path too, and all shipped APKs now carry no
+  reference to the symbol at all (verified with `readelf`).
+
+## v32 — 2026-10-19
+
+### Changed
+- Every app now runs its Android lifecycle through GameActivity (`androidx.games:games-activity`
+  4.4.0) instead of a framework NativeActivity, and the Gradle Android Plugin assembles the APK
+  instead of cargo-apk. GameActivity is the Activity Google maintains for native apps (NativeActivity
+  receives no updates), and its Java half is what hosts the soft keyboard's input connection against
+  a real view — the decor-view path never did that reliably. The Rust side of android-activity gains
+  the matching `game-activity` backend, into which the builder's earlier patches were ported: the
+  sync-picker ANR fix now bounds all three of the glue's JVM-thread waits (window handoff,
+  activity-state handoff and save-state — each a two-second timed wait), so a blocking file pick
+  still cannot freeze the UI thread's callbacks into an ANR; `show_soft_input`/`hide_soft_input`
+  prefer the Activity's imeShow/imeHide bridge before falling through to the stock calls; and
+  `set_nonblocking_callbacks` — the switch the SAF bridge flips around each pick — is exported for
+  the new backend too. The three Java activities extend GameActivity accordingly and gain the
+  kill-on-finish guard GameActivity needs: its destroy handshake waits for a native loop that a
+  stopped eframe can no longer service, so a finishing activity takes the process down with it
+  after waiting out a bounded grace period (a non-finishing destroy — the configuration-change
+  path — stays on the normal flow).
+- Because GameActivity extends AppCompatActivity, it refuses to inflate under the framework-only
+  theme every app used (the launch would die with "You need to use a Theme.AppCompat theme"). The
+  generated manifest now points at `Theme.Artcraft`, a generated AppCompat theme that keeps
+  `windowFullscreen` — the flag the edge-to-edge code builds on — plus a black first frame before
+  the Rust UI draws.
+- The build itself: cargo-ndk compiles the native library into a `jniLibs` tree, and a generated
+  single-module Gradle project (Gradle 8.11.1 wrapper, AGP 8.7.3) packages it with the Activity,
+  the resources and a freshly generated `AndroidManifest.xml` — parsed from the same Cargo metadata
+  tables cargo-apk2 read, so intent filters, permissions and activity attributes carry over one to
+  one, and libraries are stored uncompressed and page-aligned for direct loading. The APKs keep the
+  exact `versionCode` formula, `applicationId` and keystore of the cargo-apk era, so the in-app
+  Updater accepts them as ordinary updates of the same app; signing moved from cargo-apk
+  environment variables into Gradle's signingConfigs, fed the same builder key through the
+  environment at build time. Launchers also request the GPU renderer explicitly — Vulkan first,
+  GLES as the fallback for devices without usable Vulkan — and the adapter's real texture and
+  buffer limits (the values the desktop apps use), so wide and tall documents stay on the GPU
+  compositor instead of falling to egui's 8192 px CPU path. The generator version moves to **31**
+  so every generated launcher regenerates.
+- Gradle needs a JDK in the 17–23 range; the builder uses the first one it finds and, when there
+  is none, downloads Temurin 21 into `.cache/jdk/` once (the signing keystore itself is still
+  created with the system `keytool`).
+- The photocraft and vectorcraft adapters now declare the same full `configChanges` set as the
+  generated launchers, `uiMode` included: v31's live light/dark switching polls the theme every
+  frame, but without `uiMode` in the manifest a quick-settings toggle would instead have recreated
+  those two apps' activities mid-session.
+
+### Removed
+- The cargo-apk/cargo-apk2 dependency: neither tool is invoked or checked for any more.
+
+## v31 — 2026-10-19
+
+### Added
+- The interface follows the phone's light/dark setting. Every app defaults to `Appearance`
+  → system (the upstream default), which egui resolves against the OS theme it receives —
+  but on Android that theme never arrived: every other platform delivers it as a winit
+  `ThemeChanged` event, and Android's backend doesn't emit it, so an app opened in the
+  wrong mode stayed there for the whole session. The vendored egui-winit now reads the
+  Activity's `Configuration.uiMode` over JNI once per frame — the same bridge pattern the
+  clipboard backend uses — and fills `RawInput::system_theme`, the identical field the
+  desktop path fills, so the cold start is already correct. A quick-settings toggle then
+  switches live: `uiMode` is in the manifest's `configChanges` (no restart), and the
+  focus round-trip through the shade schedules the frame that carries the new value
+  before the app is visible again — with the per-frame system-bar icon sync following it
+  into the new theme. The mapping from the `uiMode` night bits to egui's theme is a pure
+  function, unit-tested alongside the module it lives in.
+
+## v30 — 2026-10-19
+
+### Added
+- Adaptive launcher icons for every app. Modern launchers mask icons into circles, squircles and
+  rounded squares, and Android 13+ can tint them with the wallpaper's palette (Material You
+  themed icons) — neither works properly with a flat square PNG, which is why the icons looked
+  out of place when themed. Every app now ships the two-layer adaptive icon the platform expects:
+  the brand colour as a solid `ic_launcher_background` vector, the artwork as
+  `ic_launcher_foreground` with its own solid background flood-filled away from the edges (so the
+  layer is the artwork silhouette on transparency, scaled to 66.56/108 of the canvas — inside the
+  launcher's visible safe zone), and the same foreground registered as the `<monochrome>` layer,
+  which gives themed icons a clean single-tint silhouette instead of a tinted square. The flat
+  density mipmaps remain for file managers and other surfaces that still read them. The artwork
+  source is the app's own vector icon where one exists (rasterised through ImageMagick), else its
+  largest own PNG; an explicit `-appicon` goes through the same pipeline. A new shared module,
+  `lib/app_icons.py`, owns the whole pipeline, and photocraft's adapter and the generated
+  launchers (plus vectorcraft's committed `res/`) all produce identical resources from it. The
+  generator version moves to **30** so every generated launcher regenerates.
+
+### Removed
+- The mouse pointer-shape experiment from the unreleased v29 work is gone again: it never showed
+  the contextual shapes on real devices, so the vendored egui-winit is back to its prior state
+  (the clipboard backend untouched) and mouse hover, wheel and secondary-click *events* remain
+  the supported pointer surface.
+
+## v29 — 2026-10-19
+
+### Added
+- Files can be dragged onto a running app. Dragging a file out of the Files app (or a browser)
+  onto the window in split-screen opens it in the app, through the identical path a share-sheet
+  delivery uses: the Activity's drag listener collects the dropped URIs, copies them into
+  app-private staging off the UI thread with the same helpers, and queues the paths for the Rust
+  shell's `intentPoll()`. Drags that carry no files are declined so they don't interfere with
+  anything else on the window, and a persistable read grant is requested when the source offered
+  one — drag grants are otherwise temporary, so without it the copy can race the end of the drag
+  (the system file picker's drags do offer persistable access).
+- WordCraft prints through Android's native print system. The print flow gains a printer named
+  "Android print system" — the one entry a device-side printer list cannot have, because Android
+  keeps enumeration inside the system print dialog so that Wi-Fi, network and cloud print
+  services are all reachable. Selecting it (auto-selected on first discovery) and submitting
+  opens the real dialog, where printer, paper size, duplex, color and page range live; the PDF
+  WordCraft already collated — range, copies and settings baked in — is staged in the cache
+  directory and served to the spooler unchanged by a `PrintDocumentAdapter` that reports the page
+  count from the system's own `PdfRenderer` and streams the full document on write (a sub-range
+  picked in the dialog itself falls back to the full document, which the app's own range settings
+  have already shaped). The submission answers synchronously over the SAF bridge, so the app
+  reports "Print job submitted." or the failure text where the desktop spooler's feedback
+  appears. `templates/android/saf_bridge.rs` grew `print_document`, and the bridge marker moves
+  to **V3**.
+
+### Changed
+- Apps present edge-to-edge: the interface draws behind transparent system bars, and the bar
+  icons (clock, battery, navigation) switch between light and dark with the app's own theme each
+  frame, so a light document no longer sits under white-on-white status icons. This is the
+  platform equivalent of AndroidX's `enableEdgeToEdge`, without the AndroidX dependency:
+  `Window.setDecorFitsSystemWindows(false)` with transparent bar colors on Android 11+, the
+  legacy layout flags below it. The Rust shell reports the active egui theme to the Activity at
+  the end of each frame (`sync_bar_appearance`; egui 0.36's `Context::theme()` is the source of
+  truth, `Context::style()` no longer exists), and the Activity applies the matching
+  `APPEARANCE_LIGHT_STATUS_BAR`/`APPEARANCE_LIGHT_NAVIGATION_BAR` window flags — or the legacy
+  `SYSTEM_UI_FLAG_*` equivalents on Android 9 and 10, carried across the replace-style set
+  instead of dropped. Selection handles and the long-press toolbar are suppressed over the
+  native surface, where they otherwise appear on every touch with no text field to belong to.
+- Hardware acceleration needed no intervention; this release verifies that rather than changing
+  it. cargo-apk2 emits no `android:hardwareAccelerated` attribute, so the platform default — on
+  for every `targetSdkVersion` of 14 and later, and every app here targets at least 28 — applies,
+  and the fullscreen `DeviceDefault` theme doesn't disable it. The rendering path was always
+  native (a `SurfaceView` window surface driven by wgpu); the builder has no WebView anywhere,
+  so WebView-only tuning such as `offscreenPreRaster` has nothing to apply to. Glyphs are
+  rasterized by epaint on the CPU as on every other egui platform and composited on the GPU
+  after that.
+- The generator version moves to 29, so every generated launcher regenerates on its next build
+  and picks all of this up. The two adapters (PhotoCraft, VectorCraft) ship their own launcher
+  sources and were untouched by the template changes.
+
+Everything above is build-verified (each stage gated on three randomly chosen apps, including
+WordCraft for the print work); on-device confirmation is pending — the test device was unplugged
+during this batch.
+
 ## v26 — 2026-10-18
 
 ### Fixed

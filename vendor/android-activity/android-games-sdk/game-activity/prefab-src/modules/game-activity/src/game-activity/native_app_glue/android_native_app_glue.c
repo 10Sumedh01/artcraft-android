@@ -29,6 +29,19 @@
 #define NATIVE_APP_GLUE_KEY_EVENTS_DEFAULT_BUF_SIZE 4
 #define NATIVE_APP_GLUE_CMD_WAIT_TIMEOUT_SECONDS 2
 
+/*
+ * While non-zero (set from Rust's `set_nonblocking_callbacks`, which the SAF bridge wraps
+ * around a blocking file pick), the JNI callbacks below still deliver their command through
+ * the message pipe -- the delivery -- but skip waiting for the Rust main thread to consume
+ * it. A blocking pick parks that thread for as long as the picker stays open, so the wait
+ * would stall the Java main thread for the whole pick: Android reports an ANR after ~5
+ * seconds. The Rust thread applies the pending state when it next reads the pipe, in the
+ * order the commands were written. When zero the waits remain, bounded by
+ * NATIVE_APP_GLUE_CMD_WAIT_TIMEOUT_SECONDS so no callback can block indefinitely.
+ * Mirrors the native-activity glue's CALLBACKS_NONBLOCKING switch.
+ */
+extern int ARTCRAFT_NONBLOCKING_CALLBACKS;
+
 #define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, "threaded_app", __VA_ARGS__))
 #define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, "threaded_app", __VA_ARGS__))
 #define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, "threaded_app", __VA_ARGS__))
@@ -340,8 +353,21 @@ static void android_app_set_window(struct android_app* android_app, ANativeWindo
     if (window != NULL) {
         android_app_write_cmd(android_app, APP_CMD_INIT_WINDOW);
     }
-    while (android_app->window != android_app->pendingWindow) {
-        pthread_cond_wait(&android_app->cond, &android_app->mutex);
+    // Bounded: if the Rust thread is parked (a blocking SAF pick) it cannot apply the
+    // pending window, and an unbounded wait here would stall the Java main thread until
+    // the pick returns. On timeout the pending window still applies when the Rust thread
+    // next reads the command pipe.
+    if (!ARTCRAFT_NONBLOCKING_CALLBACKS) {
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += NATIVE_APP_GLUE_CMD_WAIT_TIMEOUT_SECONDS;
+        while (android_app->window != android_app->pendingWindow) {
+            if (pthread_cond_timedwait(&android_app->cond, &android_app->mutex, &timeout) ==
+                ETIMEDOUT) {
+                LOGE("android_app_set_window timed out waiting for the native thread");
+                break;
+            }
+        }
     }
     pthread_mutex_unlock(&android_app->mutex);
 }
@@ -356,7 +382,11 @@ static void android_app_set_activity_state(struct android_app* android_app, int8
       pthread_mutex_unlock(&android_app->mutex);
       return;
     }
-    if (android_app_write_cmd(android_app, cmd)) {
+    // The command is always written; only the confirmation wait is skipped while the Rust
+    // thread may be parked inside a blocking pick (the pause/stop/save-state burst that a
+    // picker landing on top of this activity triggers -- waiting it out would stall the
+    // Java main thread as the picker tries to appear).
+    if (android_app_write_cmd(android_app, cmd) && !ARTCRAFT_NONBLOCKING_CALLBACKS) {
         struct timespec timeout;
         clock_gettime(CLOCK_REALTIME, &timeout);
         timeout.tv_sec += NATIVE_APP_GLUE_CMD_WAIT_TIMEOUT_SECONDS;
@@ -449,8 +479,23 @@ static void onSaveInstanceState(GameActivity* activity, SaveInstanceStateRecallb
 
     android_app->stateSaved = 0;
     android_app_write_cmd(android_app, APP_CMD_SAVE_STATE);
-    while (!android_app->stateSaved) {
-        pthread_cond_wait(&android_app->cond, &android_app->mutex);
+    // Bounded like the lifecycle waits (and skipped outright while the Rust thread may be
+    // parked in a blocking pick): saving state is common during a pick -- the activity has
+    // just been stopped behind the picker -- so an unbounded wait here would ANR on almost
+    // every pick. A timeout leaves savedState NULL, which the guard below treats as
+    // "nothing to hand back yet"; the Rust thread builds the state when it next reads the
+    // pipe, and the next save (or teardown) frees it.
+    if (!ARTCRAFT_NONBLOCKING_CALLBACKS) {
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += NATIVE_APP_GLUE_CMD_WAIT_TIMEOUT_SECONDS;
+        while (!android_app->stateSaved) {
+            if (pthread_cond_timedwait(&android_app->cond, &android_app->mutex, &timeout) ==
+                ETIMEDOUT) {
+                LOGE("onSaveInstanceState timed out waiting for the native thread");
+                break;
+            }
+        }
     }
 
     if (android_app->savedState != NULL) {

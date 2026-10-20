@@ -109,7 +109,9 @@ if [[ -n "$APPNAME" ]]; then TITLE="$APPNAME"; fi
 
 SRC="source/$APP"
 REPO="https://github.com/storytold/$APP.git"
-ANDROID_DIR="$SRC/apps/$APP-android"
+# Absolute: the build later `cd`s into the launcher directory, and cargo-ndk/Gradle paths
+# derived from $ANDROID_DIR must keep resolving from there.
+ANDROID_DIR="$ROOT/$SRC/apps/$APP-android"
 mkdir -p source build output logs keys adapters
 
 say() { printf '\n[%s] %s\n' "$1" "$2"; }
@@ -122,11 +124,12 @@ fail() {
 }
 
 # Only one build may run at a time, and the runs are not independent. `prepare.sh` replaces the
-# launcher crate under source/<app>/apps/<app>-android, and this script later runs cargo-apk2 from
-# that very directory (`cd "$ANDROID_DIR"`), which is where javac inherits its working directory. A
-# second build that wipes it mid-compile kills the first one with "Error occurred during
-# initialization of VM ... Could not determine current working directory", which points nowhere near
-# the real cause. Refuse up front instead, naming the process that holds the lock.
+# launcher crate under source/<app>/apps/<app>-android, and this script later builds from that
+# very directory (`cd "$ANDROID_DIR"`), which is where cargo-ndk's rustc and Gradle's javac
+# inherit their working directories. A second build that wipes it mid-compile kills the first one
+# with "Error occurred during initialization of VM ... Could not determine current working
+# directory", which points nowhere near the real cause. Refuse up front instead, naming the
+# process that holds the lock.
 BUILD_LOCK="$ROOT/.artcraft-build.lock"
 if command -v flock >/dev/null 2>&1; then
     exec {BUILD_LOCK_FD}>>"$BUILD_LOCK"
@@ -145,36 +148,78 @@ command -v python3 >/dev/null 2>&1 || fail "Python 3.11+ is required (tomllib is
 python3 -c 'import tomllib' >/dev/null 2>&1 || fail "Python 3.11+ with tomllib is required."
 
 # Apps whose launcher (adapter or builder-generated) ships a Java Storage Access Framework Activity.
-# Kept here in addition to the manifest check below so cargo-apk2 is selected even on the very first
-# build, before the launcher has been generated. Keep in sync with SAF_RECIPES in this file.
+# Kept here in addition to the manifest check below so bridge verification covers the very first
+# build too, before the launcher has been generated. Keep in sync with SAF_RECIPES in this file.
 SAF_APPS=" designcraft deckcraft gridcraft wordcraft lightcraft effectcraft filmcraft cadcraft soundcraft pdfcraft figcraft "
 needs_saf() {
     [[ " $SAF_APPS " == *" $1 "* ]]
 }
 
 # An adapter (or generated launcher) that ships Java sources (the Storage Access Framework file
-# pickers) needs cargo-apk2: cargo-apk ignores `java_sources` and cannot compile the Activity that
-# answers open/save for the Rust UI. Any app that declares `java_sources` is built with cargo-apk2.
+# pickers) needs its Activity compiled into the APK, which the Gradle Android Plugin does below.
+# `needs_apk2` still marks those apps for bridge verification after the build.
 needs_apk2() {
     needs_saf "$1" && return 0
     local manifest="$ROOT/adapters/$1/Cargo.toml"
     [[ -f "$manifest" ]] && grep -q '^[[:space:]]*java_sources' "$manifest"
 }
 
-if needs_apk2 "$APP"; then
-    if ! cargo apk2 --help >/dev/null 2>&1; then
-        echo "$TITLE's Android file picker needs cargo-apk2 (Java Activity support). Installing it..."
-        cargo install cargo-apk2 --locked || fail "Could not install cargo-apk2. Install it manually with: cargo install cargo-apk2 --locked"
-    fi
-    cargo apk2 build --help >/dev/null 2>&1 || fail "cargo-apk2 is required for $TITLE's Android file picker. Install it with: cargo install cargo-apk2 --locked"
-else
-    cargo apk build --help >/dev/null 2>&1 || fail "cargo-apk is missing. Install it with: cargo install cargo-apk --locked"
+# The build compiles the native library with cargo-ndk (a jniLibs tree) and packages that tree,
+# the Java Activity and the generated manifest with Gradle (see below). cargo-apk/cargo-apk2 are
+# no longer invoked.
+if ! cargo ndk --help >/dev/null 2>&1; then
+    echo "cargo-ndk is needed to build $TITLE's native Android library. Installing it..."
+    cargo install cargo-ndk --locked || fail "Could not install cargo-ndk. Install it manually with: cargo install cargo-ndk --locked"
 fi
+cargo ndk -V >/dev/null 2>&1 || fail "cargo-ndk is required but not working. Install it with: cargo install cargo-ndk --locked"
 
-# Prove the packaged APK really carries the Android file bridge the adapter declares. This matters
-# because cargo-apk2 silently builds an APK with NO launcher activity (and so one that cannot be
-# started from the home screen) when the adapter's activity omits its MAIN/LAUNCHER intent-filter;
-# a green Rust build alone would not catch that.
+# Gradle 8.11.1 with AGP 8.7.3 (see lib/android_project.py) cannot run on the newest JDKs —
+# Java 25 dies in the Groovy build scripts with "Unsupported class file major version 69" —
+# while keytool above is happiest on one. Use a detected JDK 17-23 for Gradle, or fetch a
+# Temurin 21 into the builder's cache once when there is none.
+find_gradle_jdk() {
+    local dir major
+    for dir in /usr/lib/jvm/* /usr/lib*/jvm/* /opt/java/* /opt/jdk/* "$HOME"/.sdkman/candidates/java/*; do
+        [[ -x "$dir/bin/java" && -x "$dir/bin/javac" ]] || continue
+        major="$("$dir/bin/java" -version 2>&1 | head -n1 | sed -nE 's/.*version "([0-9]+).*/\1/p')"
+        [[ "$major" =~ ^[0-9]+$ ]] || continue
+        if ((major >= 17 && major <= 23)); then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+bootstrap_gradle_jdk() {
+    local cache="$ROOT/.cache/jdk" dir="$ROOT/.cache/jdk/temurin-21" arch extracted tmp
+    if [[ -x "$dir/bin/java" && -x "$dir/bin/javac" ]]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    case "$(uname -m)" in
+        x86_64) arch="x64" ;;
+        aarch64 | arm64) arch="aarch64" ;;
+        *) fail "No Temurin JDK 21 build is known for architecture $(uname -m). Install a JDK 17-23 manually." ;;
+    esac
+    mkdir -p "$cache"
+    tmp="$(mktemp -d "$cache/jdk-download.XXXXXX")"
+    curl -fL --retry 3 -o "$tmp/jdk.tar.gz" \
+        "https://api.adoptium.net/v3/binary/latest/21/ga/linux/$arch/jdk/hotspot/normal/eclipse" \
+        || { rm -rf "$tmp"; fail "Could not download the Temurin JDK 21 Gradle needs. Install a JDK 17-23 manually."; }
+    tar -xzf "$tmp/jdk.tar.gz" -C "$tmp" || { rm -rf "$tmp"; fail "The downloaded JDK archive could not be extracted."; }
+    extracted="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d -name 'jdk-*' | head -n1)"
+    [[ -n "$extracted" && -x "$extracted/bin/javac" ]] || { rm -rf "$tmp"; fail "The downloaded JDK archive is missing bin/javac."; }
+    rm -rf "$dir"
+    mv "$extracted" "$dir"
+    rm -rf "$tmp"
+    printf '%s\n' "$dir"
+}
+
+# Prove the packaged APK really carries the Android file bridge the adapter declares. The
+# generated manifest mirrors the adapter's Cargo metadata one to one, so an activity that
+# omits its MAIN/LAUNCHER intent-filter would still build into an APK with no launcher icon
+# (unstartable from the home screen); a green build alone would not catch that.
 verify_android_bridge() {
     local app="$1" apk="$2"
     needs_apk2 "$app" || return 0
@@ -311,7 +356,7 @@ if fixed:
     print(f"  Repaired upstream compile errors still present in {title}: {', '.join(fixed)}")
 PY
 
-say 4 "Preparing the NativeActivity launcher..."
+say 4 "Preparing the GameActivity launcher..."
 if [[ -x "adapters/$APP/prepare.sh" ]]; then
     echo "Using app-specific adapter: adapters/$APP/prepare.sh"
     bash "adapters/$APP/prepare.sh" "$APP" "$TITLE" "$SRC" "$MODE"
@@ -332,7 +377,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "26"
+GENERATOR_VERSION = "32"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -349,6 +394,11 @@ if (custom / "Cargo.toml").is_file() and (custom / "src" / "lib.rs").is_file():
     shutil.copy2(root / "templates" / "android" / "system_fonts.rs", android_dir / "src" / "system_fonts.rs")
     # The shared Android soft-keyboard bridge, referenced by `mod ime_bridge;` in the adapter.
     shutil.copy2(root / "templates" / "android" / "ime_bridge.rs", android_dir / "src" / "ime_bridge.rs")
+    # The adapter's launcher gets the same icons as the generated ones: density mipmaps plus the
+    # API 26+ adaptive layers (see lib/app_icons.py).
+    import app_icons
+
+    app_icons.generate(src, app, android_dir / "res", Path(appicon) if appicon else None)
     # Advertise the app's file associations (Android open/share intent filters) in the copied
     # manifest, from the same table the generated launchers use.
     file_associations.patch_cargo_toml(android_dir / "Cargo.toml", app)
@@ -411,7 +461,7 @@ for p in ui_src.rglob("*.rs"):
 SPECIAL = {
     "filmcraft": {"app_type": "FilmcraftApp", "construct": "{app}::new(Session::default())"},
     "pdfcraft": {"construct": "{app}::new()"},
-    "effectcraft": {"app_type": "EffectcraftApp", "construct": "{app}::new(Session::new())"},
+    "effectcraft": {"app_type": "EffectcraftApp", "construct": "{app}::new(effectcraft_host::session())"},
     "lightcraft": {"app_type": "LightcraftApp", "construct": "{app}::new(Session::new().with_fs(), Services::default())"},
     "figcraft": {"app_type": "FigApp", "construct": "{app}::new(Session::new(), Box::new(NoServices))"},
     "wordcraft": {
@@ -987,6 +1037,7 @@ fn saf_write_and_commit(bridge: &saf::Bridge, path: &str, bytes: &[u8]) -> Resul
         "services": '''
 fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> Services {
     let open_bridge = bridge.clone_ref();
+    let print_bridge = bridge.clone_ref();
     let save_bridge = bridge.clone_ref();
     let open_state = Arc::clone(&state);
     let save_state = Arc::clone(&state);
@@ -1006,6 +1057,38 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
                 return Err(error);
             }
             Ok(())
+        })),
+        // Android keeps printer choice inside the system print dialog: it reaches every printer
+        // the device knows (Wi-Fi, network, cloud print services), not just ones an in-app list
+        // could discover itself. Offer exactly that one entry — named and defaulted so File >
+        // Print's auto-selection settles on it and enables submission — and the dialog the
+        // submit opens does the real printer/paper/duplex/color/page-range picking.
+        printers: Some(Box::new(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(vec![wordcraft_ui_egui::printing::Printer {
+                name: "Android print system".to_owned(),
+                default: true,
+            }]);
+            rx
+        })),
+        // The document arrives as a PDF WordCraft already collated (range and settings baked
+        // in), so handing it straight to the system spooler is the whole job; Java answers
+        // inside the same call, letting us report success or the reason for failure right
+        // where the desktop spooler would have.
+        print_native: Some(Box::new(move |bytes: Vec<u8>, _settings: wordcraft_ui_egui::printing::Settings, _collate: bool, _options: Vec<(String, String)>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let receipt = print_bridge
+                .print_document("WordCraft", &bytes)
+                .and_then(|answer| {
+                    if answer == "OK" {
+                        // Empty receipt renders as the clean "Print job submitted." message.
+                        Ok(String::new())
+                    } else {
+                        Err(answer)
+                    }
+                });
+            let _ = tx.send(receipt);
+            rx
         })),
         inbox: Some(inbox),
         ..Services::default()
@@ -1147,7 +1230,7 @@ fn saf_hooks(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> Hoo
 }
 ''',
         "poll": SYNC_SAF_POLL,
-        "construct_expr": "EffectcraftApp::new(Session::new())",
+        "construct_expr": "EffectcraftApp::new(effectcraft_host::session())",
         "post_construct": "    inner.hooks = saf_hooks(saf_bridge.clone_ref(), std::sync::Arc::clone(&saf_state), saf_inbox.clone());\n    inner.hooks.audio_device = Some(Box::new(|out: &effectcraft_ui_egui::audio::AudioOutput| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audio_out::open(out))).ok().flatten()));\n    inner.hooks.audio_devices = Some(Box::new(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(audio_out::devices)).unwrap_or_default()));\n",
     },
     "filmcraft": {
@@ -1933,30 +2016,11 @@ if saf and app == "figcraft" and re.search(r"fn pick_open\([^)]*\)\s*->\s*Dialog
         flags=re.S,
     )
 
-# Prefer the app's own icon; don't accidentally bundle another ArtCraft app's branding.
-# An explicit -appicon always wins.
-if appicon:
-    icon = Path(appicon)
-    if not icon.is_file():
-        raise SystemExit(f"App icon not found: {appicon}")
-else:
-    # The icon lives in the app's own source tree, where upstream still names it after its original
-    # `ai.storyteller.<app>` package, so that spelling comes first; the `com.artcraft.<app>` and bare
-    # `<app>` spellings are kept as fallbacks in case upstream renames the asset.
-    icon_candidates = [
-        src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"ai.storyteller.{app}.png",
-        src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"com.artcraft.{app}.png",
-        src / "assets" / "app-icon" / "hicolor" / "256x256" / "apps" / f"{app}.png",
-        src / "assets" / "app-icon" / f"ai.storyteller.{app}.png",
-        src / "assets" / "app-icon" / f"com.artcraft.{app}.png",
-        src / "assets" / "app-icon" / f"{app}.png",
-    ]
-    icon = next((p for p in icon_candidates if p.is_file()), None)
-    if icon is None:
-        matches = [p for p in (src / "assets").rglob("*.png") if "app-icon" in p.parts and app in p.name.lower()]
-        icon = sorted(matches)[0] if matches else None
-    if icon is None:
-        raise SystemExit(f"Could not find an app-specific PNG icon under assets/app-icon for {app}; pass -appicon=<path> or create a custom adapter.")
+# Launcher icons come from the one shared module: density mipmaps plus the API 26+ adaptive
+# layers (background / foreground / monochrome — see lib/app_icons.py). It prefers an explicit
+# -appicon, then the app's own vector source, then its largest own PNG, and never another
+# ArtCraft app's branding.
+import app_icons
 
 # Stage in a temporary sibling and publish the Android crate only when every generated file is ready.
 staging_dir = android_dir.with_name(android_dir.name + ".artcraft-staging")
@@ -1964,20 +2028,7 @@ if staging_dir.exists():
     shutil.rmtree(staging_dir)
 staging_dir.mkdir(parents=True)
 try:
-    for density in ("mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"):
-        out_dir = staging_dir / "res" / f"mipmap-{density}"
-        out_dir.mkdir(parents=True)
-        sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
-        magick = shutil.which("magick")
-        convert = shutil.which("convert")
-        if magick:
-            import subprocess
-            subprocess.run([magick, str(icon), "-resize", f"{sizes[density]}x{sizes[density]}", str(out_dir / "ic_launcher.png")], check=True)
-        elif convert:
-            import subprocess
-            subprocess.run([convert, str(icon), "-resize", f"{sizes[density]}x{sizes[density]}", str(out_dir / "ic_launcher.png")], check=True)
-        else:
-            shutil.copy2(icon, out_dir / "ic_launcher.png")
+    icon = app_icons.generate(src, app, staging_dir / "res", Path(appicon) if appicon else None)
 
     serde_dep = 'serde_json = { workspace = true }\n' if (saf or _persist) else ''
     # The SAF bridge for rfd-driven apps (pdfcraft) calls `rfd::artcraft_saf` from the launcher, so
@@ -1994,6 +2045,10 @@ try:
         "deckcraft": ("audio", "audio.rs", ("deckcraft-media = { workspace = true }",)),
     }
     cpal_dep = "".join(f"{dep}\n" for dep in ('cpal = "0.16"', *AUDIO_MODULES[app][2])) if app in AUDIO_MODULES else ''
+    # EffectCraft's Android launcher must build a fully wired session (`effectcraft-host`), not a
+    # bare `Session::new()`: without the host's importer and exporter, every import and export fails
+    # with "media import is not available in this build" / "export is not available in this build".
+    host_dep = 'effectcraft-host = { path = "../../crates/host" }\n' if app == "effectcraft" else ''
     java_sources = 'java_sources = "java"\n' if saf else ''
     config_changes = "orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|smallestScreenSize|density|layoutDirection|uiMode|fontScale|locale"
     # Android open/share associations for the app's document types (the MAIN/LAUNCHER entry is always
@@ -2007,10 +2062,9 @@ label = "{title}"
 launch_mode = "singleTask"
 orientation = "sensor"
 exported = true
-# cargo-apk2 does NOT add a default MAIN/LAUNCHER filter when an activity is named, so declare it
-# here: without it the APK has no launcher activity and cannot start from the home screen. The
-# remaining filters register the app for its document types so the system can open/share them with
-# it. Keep it inline: cargo-apk2's serde `flatten` rejects an `[[...activity.intent_filter]]` table.
+# The MAIN/LAUNCHER filter that gives the APK a launcher icon; the remaining filters register
+# the app for its document types so the system can open and share them with it. Keep it inline:
+# lib/file_associations.py rewrites the single `intent_filter = ...` line in place.
 intent_filter = {intent_filter_value}
 
 [[package.metadata.android.application.activity.meta_data]]
@@ -2046,13 +2100,14 @@ crate-type = ["cdylib"]
 [dependencies]
 {engine_pkg} = {{ path = "../../crates/engine" }}
 {ui_pkg} = {{ path = "../../crates/ui-egui" }}
-eframe = {{ workspace = true, features = ["wgpu", "persistence"] }}
+eframe = {{ workspace = true, features = ["wgpu", "persistence", "android-game-activity"] }}
 egui = {{ workspace = true }}
+egui-winit = "0.36"
 log = {{ workspace = true }}
 jni = "0.22"
-{serde_dep}{rfd_dep}{cpal_dep}
+{serde_dep}{rfd_dep}{cpal_dep}{host_dep}
 [target.'cfg(target_os = "android")'.dependencies]
-android-activity = {{ version = "0.6", default-features = false, features = ["native-activity"] }}
+android-activity = {{ version = "0.6", default-features = false, features = ["game-activity"] }}
 
 [package.metadata.android]
 package = "{package_name}"
@@ -2080,7 +2135,9 @@ name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [package.metadata.android.application]
 label = "{title}"
-theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+# GameActivity extends AppCompatActivity, which refuses to inflate under a framework-only
+# theme; the Gradle step below generates res/values/themes.xml with this style.
+theme = "@style/Theme.Artcraft"
 icon = "@mipmap/ic_launcher"
 
 {activity_block}'''
@@ -2179,16 +2236,58 @@ fn apply_immersive_fullscreen(app: &AndroidApp) {
             // | LAYOUT_FULLSCREEN | IMMERSIVE_STICKY
             const IMMERSIVE: i32 =
                 0x0000_0100 | 0x0000_0002 | 0x0000_0004 | 0x0000_0200 | 0x0000_0400 | 0x0000_1000;
+            // SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR: this
+            // replace-style set must not wipe the icon contrast that reflects the app's theme
+            // (setBarIconAppearance) on Android 9/10, where the refresh can run repeatedly.
+            const LIGHT_ICON_FLAGS: i32 = 0x2000 | 0x0010;
+            let visibility = env
+                .call_method(
+                    &decor,
+                    jni_str!("getSystemUiVisibility"),
+                    jni_sig!("()I"),
+                    &[],
+                )?
+                .i()?;
             env.call_method(
                 &decor,
                 jni_str!("setSystemUiVisibility"),
                 jni_sig!("(I)V"),
-                &[JValue::Int(IMMERSIVE)],
+                &[JValue::Int((visibility & LIGHT_ICON_FLAGS) | IMMERSIVE)],
             )?;
             Ok(())
         });
         if let Err(error) = result {
             log::error!("Could not apply immersive fullscreen: {error}");
+        }
+    }));
+}
+
+/// Keep the system-bar icon contrast on the app's active theme.
+///
+/// The bars are edge-to-edge (they float over the canvas when a swipe brings them in), so their
+/// icon color must follow what egui is drawing: dark icons over a light theme, light icons over
+/// a dark one. egui's choice arrives here as `light_theme` and the Activity applies
+/// `APPEARANCE_LIGHT_*` on the Java main thread, just like the fullscreen calls — `android_main`
+/// must not block waiting for it. Runs only when the theme actually changes.
+fn apply_bar_appearance(app: &AndroidApp, light_theme: bool) {
+    let app_clone = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
+        let jvm = unsafe { JavaVM::from_raw(app_clone.vm_as_ptr() as *mut _) };
+        let result = jvm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let activity_raw = app_clone.activity_as_ptr() as jni::sys::jobject;
+            // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it.
+            let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+            env.call_method(
+                &*activity,
+                jni_str!("setBarIconAppearance"),
+                jni_sig!("(Z)V"),
+                &[JValue::Bool(light_theme)],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            log::error!("Could not style the Android system bars: {error}");
         }
     }));
 }
@@ -2516,15 +2615,30 @@ struct AndroidShell {{
     ime: ime_bridge::ime::ImeBridge,
     modifiers: egui::Modifiers,
     fullscreen_applied: bool,
-    probe: InputProbe,{saf_fields}{intent_field}{persist_fields}{staged_fields}
+    probe: InputProbe,
+    bars_theme: Option<bool>,{saf_fields}{intent_field}{persist_fields}{staged_fields}
 }}
 
 impl AndroidShell {{
     fn new(mut inner: {app_type}, app: AndroidApp{saf_new_params}) -> Self {{
         {persist_new_body}let ime = ime_bridge::ime::ImeBridge::new(&app);
-        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(){saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
+        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(), bars_theme: None{saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
     }}
 {saf_poll_method}{intent_method}{persist_methods}{staged_methods}
+    /// Keep the system-bar icon contrast on the app's active theme: egui's light/dark choice is
+    /// compared every frame and only a flip reaches Java (`apply_bar_appearance`), where the
+    /// edge-to-edge bars get dark icons over a light canvas and light icons over a dark one.
+    fn sync_bar_appearance(&mut self, ctx: &egui::Context) {{
+        // `Context::style()` is gone in egui 0.36; `theme()` is what selects the active
+        // light/dark style, so it is exactly the choice the bars must mirror.
+        let light_theme = ctx.theme() == egui::Theme::Light;
+        if self.bars_theme == Some(light_theme) {{
+            return;
+        }}
+        self.bars_theme = Some(light_theme);
+        apply_bar_appearance(&self.app, light_theme);
+    }}
+
     /// Re-apply sticky immersive mode on the first frame and whenever the window regains focus
     /// (the system restores the bars after a gesture or when another activity closes).
     fn refresh_fullscreen(&mut self, raw: &egui::RawInput) {{
@@ -2570,6 +2684,7 @@ impl AndroidShell {{
 impl eframe::App for AndroidShell {{
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {{
 {intent_logic}{saf_logic_poll}{persist_logic}{staged_logic}        {inner_logic}
+        self.sync_bar_appearance(ctx);
     }}
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {{
@@ -2614,6 +2729,7 @@ impl eframe::App for AndroidShell {{
 fn android_main(android_app: android_activity::AndroidApp) {{
     log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}}, {{}})", saf::SAF_MARKER, ime_bridge::ime::IME_MARKER);
     apply_immersive_fullscreen(&android_app);
+    egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
 {persist_env_call}    system_fonts::install_font_env(&android_app);
     let saf_bridge = saf::Bridge::new(&android_app);
     saf_bridge.request_storage_permission();
@@ -2621,13 +2737,38 @@ fn android_main(android_app: android_activity::AndroidApp) {{
     let saf_inbox = SafInbox::default();
 {saf_setup}    {inner_decl} = {construct_expr};
 {post_construct}    let shell = AndroidShell::new(inner, android_app.clone(), saf_bridge, saf_state, saf_inbox);
-    let options = eframe::NativeOptions {{
+    let mut options = eframe::NativeOptions {{
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("{title}")
             .with_drag_and_drop(true),
         android_app: Some(android_app),
         ..Default::default()
     }};
+    // Vulkan first with a GLES fallback for devices without a usable Vulkan driver, and the
+    // adapter's own texture/buffer sizes: egui's 8192 px default cap sends documents wider or
+    // taller than that to the CPU compositor (the desktop apps do this in their gpu_canvas).
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {{
+        create.instance_descriptor.backends = eframe::wgpu::Backends::VULKAN | eframe::wgpu::Backends::GL;
+        create.device_descriptor = std::sync::Arc::new(|adapter: &eframe::wgpu::Adapter| {{
+            let supported = adapter.limits();
+            let base = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {{
+                eframe::wgpu::Limits::downlevel_webgl2_defaults()
+            }} else {{
+                eframe::wgpu::Limits::default()
+            }};
+            let base = base.or_worse_values_from(&supported);
+            eframe::wgpu::DeviceDescriptor {{
+                label: Some("{title} wgpu device"),
+                required_limits: eframe::wgpu::Limits {{
+                    max_texture_dimension_2d: supported.max_texture_dimension_2d,
+                    max_buffer_size: supported.max_buffer_size,
+                    ..base
+                }},
+                ..Default::default()
+            }}
+        }});
+    }}
     let result = eframe::run_native(
         "{title}",
         options,
@@ -2649,15 +2790,41 @@ fn android_main(android_app: android_activity::AndroidApp) {{
 fn android_main(android_app: android_activity::AndroidApp) {{
     log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}})", ime_bridge::ime::IME_MARKER);
     apply_immersive_fullscreen(&android_app);
+    egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
 {persist_env_call}    system_fonts::install_font_env(&android_app);
     let shell_app = android_app.clone();
-    let options = eframe::NativeOptions {{
+    let mut options = eframe::NativeOptions {{
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("{title}")
             .with_drag_and_drop(true),
         android_app: Some(android_app),
         ..Default::default()
     }};
+    // Vulkan first with a GLES fallback for devices without a usable Vulkan driver, and the
+    // adapter's own texture/buffer sizes: egui's 8192 px default cap sends documents wider or
+    // taller than that to the CPU compositor (the desktop apps do this in their gpu_canvas).
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {{
+        create.instance_descriptor.backends = eframe::wgpu::Backends::VULKAN | eframe::wgpu::Backends::GL;
+        create.device_descriptor = std::sync::Arc::new(|adapter: &eframe::wgpu::Adapter| {{
+            let supported = adapter.limits();
+            let base = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {{
+                eframe::wgpu::Limits::downlevel_webgl2_defaults()
+            }} else {{
+                eframe::wgpu::Limits::default()
+            }};
+            let base = base.or_worse_values_from(&supported);
+            eframe::wgpu::DeviceDescriptor {{
+                label: Some("{title} wgpu device"),
+                required_limits: eframe::wgpu::Limits {{
+                    max_texture_dimension_2d: supported.max_texture_dimension_2d,
+                    max_buffer_size: supported.max_buffer_size,
+                    ..base
+                }},
+                ..Default::default()
+            }}
+        }});
+    }}
     let result = eframe::run_native(
         "{title}",
         options,
@@ -2702,7 +2869,7 @@ print(f"Generated NativeActivity wrapper for {title}.")
 print(f"  Engine crate: {engine_pkg}")
 print(f"  UI crate: {ui_pkg}")
 print(f"  UI app type: {app_type}")
-print(f"  Icon: {icon.relative_to(src)}")
+print(f"  Icon: {icon.relative_to(src) if icon.is_relative_to(src) else icon}")
 print("  Orientation: sensor (allows portrait and landscape rotation)")
 PY
 fi
@@ -2825,19 +2992,18 @@ if entry not in s:
     p.write_text(s)
 PY
 
-# The sync-picker ANR fix lives in android-activity's glue layer: while a blocking pick
-# parks the Rust main thread, JVM-thread lifecycle callbacks must not block on it (they
-# would be ANR'd by Android after ~5s). The builder's Android soft-keyboard bridge also
-# overrides android-activity's native `show_soft_input`/`hide_soft_input` so they drive the
-# Activity's own editable IME view (see templates/android/SafActivity.java) instead of the
-# unreliable decor-view call. Both fixes live in the vendored copy, so any launcher that uses
-# the SAF bridge (`ARTCRAFT_ANDROID_SAF_BRIDGE`) or the IME bridge (`mod ime_bridge`) needs it;
-# the others keep the crates.io dependency.
-if grep -qE 'ARTCRAFT_ANDROID_SAF_BRIDGE|mod ime_bridge' "$ANDROID_DIR/src/lib.rs"; then
-    echo "Vendoring the ANR-safe android-activity glue for $TITLE..."
-    rm -rf "$SRC/vendor/android-activity"
-    cp -a "$ROOT/vendor/android-activity" "$SRC/vendor/android-activity"
-    python3 - "$SRC/Cargo.toml" <<'PY'
+# Every launcher uses the builder's vendored android-activity: the game-activity backend now
+# carries three builder patches the crates.io copy lacks. (1) The sync-picker ANR fix: while a
+# blocking pick parks the Rust main thread, the JVM-thread lifecycle, save-state and window
+# callbacks must not wait on it (they would be ANR'd by Android after ~5s); the SAF bridge flips
+# `set_nonblocking_callbacks` around each pick and the C glue then only writes the command pipe.
+# (2) `show_soft_input`/`hide_soft_input` prefer the Activity's own editable IME view
+# (imeShow/imeHide, see templates/android/SafActivity.java) over the unreliable decor-view call.
+# (3) `set_nonblocking_callbacks` is exported for game-activity too (the SAF bridge calls it).
+echo "Vendoring the ANR-safe android-activity glue for $TITLE..."
+rm -rf "$SRC/vendor/android-activity"
+cp -a "$ROOT/vendor/android-activity" "$SRC/vendor/android-activity"
+python3 - "$SRC/Cargo.toml" <<'PY'
 from pathlib import Path
 import sys, tomllib
 p = Path(sys.argv[1])
@@ -2852,7 +3018,6 @@ if entry not in s:
     tomllib.loads(s)
     p.write_text(s)
 PY
-fi
 
 # A `target/` directory left behind by running cargo inside a vendored crate must never be
 # copied into the app tree: it is hundreds of megabytes and cargo ignores nested target dirs
@@ -2891,29 +3056,14 @@ if [[ ! -f "$KEY" ]]; then
     chmod 600 "$KEY"
 fi
 
-# cargo-apk versions that predate signing environment variables can still use the same key.
-# This path is relative to the generated Android crate's Cargo.toml and remains inside this builder.
-if [[ -f "$ANDROID_DIR/.artcraft-android-builder-generated" ]]; then
-    python3 - "$ANDROID_DIR/Cargo.toml" "$KEY_PASSWORD" <<'PY'
-from pathlib import Path
-import json, sys, tomllib
-p = Path(sys.argv[1])
-password = json.dumps(sys.argv[2])
-s = p.read_text()
-for profile in ("dev", "release"):
-    section = f"[package.metadata.android.signing.{profile}]"
-    if section not in s:
-        s = s.rstrip() + f"\n\n{section}\npath = \"../../../../keys/artcraft-builder.jks\"\nkeystore_password = {password}\n"
-tomllib.loads(s)
-p.write_text(s)
-PY
-fi
+# The same key reaches Gradle at build time through ARTCRAFT_KEYSTORE* environment variables
+# (wired to the signingConfigs in the generated project below); the launcher's Cargo.toml no
+# longer carries a signing section.
 
 say 6 "Building $TITLE ($MODE)..."
 mkdir -p "build/$APP/target" output logs
 export CARGO_TARGET_DIR="$ROOT/build/$APP/target"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BUILD_START_EPOCH="$(date +%s)"
 LOG="logs/$APP-$MODE-$STAMP.log"
 cd "$ANDROID_DIR"
 
@@ -2947,50 +3097,78 @@ PY
 )"
 
 # FigCraft and DeckCraft set `CRAFT_FONTS_DIR = "../craft-fonts"` (relative) in .cargo/config.toml.
-# cargo-subcommand, which cargo-apk uses to locate the workspace, canonicalizes that path and aborts
-# with an I/O error when the directory is absent. Create an (empty) directory so the path resolves;
-# the fonts are optional and the app's build script warns and uses system fonts when they are missing.
+# Keep the (empty) directory present so the path resolves in every app's build script; the fonts
+# are optional and a missing directory makes those scripts warn and use system fonts.
 mkdir -p "$ROOT/source/craft-fonts"
 
-if needs_apk2 "$APP"; then APK_CMD=(cargo apk2 build); else APK_CMD=(cargo apk build); fi
+# The Gradle project, AndroidManifest.xml and theme resource are regenerated from the launcher's
+# Cargo metadata on every build (see lib/android_project.py).
+echo "  -> generating AndroidManifest.xml, the theme resource and the Gradle project"
+python3 "$ROOT/lib/android_project.py" "$ROOT" "$ANDROID_DIR" "$APP" "$APP_VERSION"
+# MIN_SDK feeds cargo-ndk's --platform below and must match the APK's minSdk.
+# shellcheck source=/dev/null
+source "$ANDROID_DIR/.artcraft-gradle.properties"
+
+echo "  -> building the native library with cargo-ndk (arm64-v8a, API $MIN_SDK)"
+rm -rf "$ANDROID_DIR/jniLibs"
 if [[ "$MODE" == "release" ]]; then
-    if CARGO_APK_RELEASE_KEYSTORE="$ROOT/$KEY" \
-       CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$KEY_PASSWORD" \
-       "${APK_CMD[@]}" --release 2>&1 | tee "$ROOT/$LOG"; then
+    if cargo ndk -t arm64-v8a -P "$MIN_SDK" -o "$ANDROID_DIR/jniLibs" build --release 2>&1 | tee "$ROOT/$LOG"; then
         :
     else
         status=$?
-        fail "Release build failed (exit $status). Log: $ROOT/$LOG"
+        fail "Release native build failed (exit $status). Log: $ROOT/$LOG"
     fi
+else
+    if cargo ndk -t arm64-v8a -P "$MIN_SDK" -o "$ANDROID_DIR/jniLibs" build 2>&1 | tee "$ROOT/$LOG"; then
+        :
+    else
+        status=$?
+        fail "Debug native build failed (exit $status). Log: $ROOT/$LOG"
+    fi
+fi
+
+GRADLE_JDK="$(find_gradle_jdk || true)"
+if [[ -z "$GRADLE_JDK" ]]; then
+    echo "  -> no JDK 17-23 found; downloading Temurin JDK 21 into .cache/jdk"
+    GRADLE_JDK="$(bootstrap_gradle_jdk)"
+fi
+echo "  -> Gradle JDK: $GRADLE_JDK"
+
+if [[ "$MODE" == "release" ]]; then
+    GRADLE_TASK="assembleRelease"
+    GRADLE_VARIANT="release"
     FINAL_APK="$ROOT/output/$APP-$APP_VERSION.apk"
 else
-    if CARGO_APK_DEV_KEYSTORE="$ROOT/$KEY" \
-       CARGO_APK_DEV_KEYSTORE_PASSWORD="$KEY_PASSWORD" \
-       "${APK_CMD[@]}" 2>&1 | tee "$ROOT/$LOG"; then
-        :
-    else
-        status=$?
-        fail "Debug build failed (exit $status). Log: $ROOT/$LOG"
-    fi
+    GRADLE_TASK="assembleDebug"
+    GRADLE_VARIANT="debug"
     FINAL_APK="$ROOT/output/$APP-$APP_VERSION-debug.apk"
 fi
 
-# cargo-apk and cargo-apk2 have used slightly different APK output subdirectories/names.
-# Prefer an APK freshly produced by this invocation; fall back to the legacy path for older versions.
-BUILT_APK="$(find "$CARGO_TARGET_DIR" -type f -name '*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk -v started="$BUILD_START_EPOCH" '$1 >= started - 3 { $1=""; sub(/^ /, ""); print; exit }')"
-if [[ -z "$BUILT_APK" ]]; then
-    if [[ "$MODE" == "release" && -f "$CARGO_TARGET_DIR/release/apk/$APP.apk" ]]; then
-        BUILT_APK="$CARGO_TARGET_DIR/release/apk/$APP.apk"
-    elif [[ "$MODE" == "debug" && -f "$CARGO_TARGET_DIR/debug/apk/$APP.apk" ]]; then
-        BUILT_APK="$CARGO_TARGET_DIR/debug/apk/$APP.apk"
-    fi
+echo "  -> packaging and signing with Gradle ($GRADLE_TASK)"
+if (
+    cd "$ANDROID_DIR/android" &&
+    JAVA_HOME="$GRADLE_JDK" \
+    ARTCRAFT_KEYSTORE="$ROOT/$KEY" \
+    ARTCRAFT_KEYSTORE_PASSWORD="$KEY_PASSWORD" \
+    ARTCRAFT_KEY_ALIAS="artcraftbuilder" \
+    ARTCRAFT_KEY_PASSWORD="$KEY_PASSWORD" \
+    ./gradlew --console=plain "$GRADLE_TASK"
+) 2>&1 | tee -a "$ROOT/$LOG"; then
+    :
+else
+    status=$?
+    fail "Gradle $GRADLE_TASK failed (exit $status). Log: $ROOT/$LOG"
 fi
 
+# A single-module root project writes build/outputs/apk/<variant>/<rootProject.name>-<variant>.apk;
+# an APK whose buildType got no signingConfig lands as -unsigned, which the check below rejects.
+APK_DIR="$ANDROID_DIR/android/build/outputs/apk/$GRADLE_VARIANT"
+BUILT_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*-unsigned.apk' 2>/dev/null | head -n1)"
 [[ -n "$BUILT_APK" && -f "$BUILT_APK" ]] || {
-    echo "Expected a newly built APK under $CARGO_TARGET_DIR" >&2
+    echo "Expected a Gradle APK under $APK_DIR" >&2
     echo "Searching generated artifacts:" >&2
-    find "$CARGO_TARGET_DIR" -type f -name '*.apk' -print >&2 || true
-    fail "Build command returned success but the APK artifact was not found. Log: $ROOT/$LOG"
+    find "$ANDROID_DIR/android/build/outputs" -type f -name '*.apk' -print >&2 || true
+    fail "Gradle reported success but the APK artifact was not found. Log: $ROOT/$LOG"
 }
 cp -f "$BUILT_APK" "$FINAL_APK"
 

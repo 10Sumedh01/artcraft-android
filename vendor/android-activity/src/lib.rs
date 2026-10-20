@@ -449,7 +449,7 @@ impl From<ndk_sys::ARect> for Rect {
 
 pub use activity_impl::StateLoader;
 pub use activity_impl::StateSaver;
-#[cfg(feature = "native-activity")]
+#[cfg(any(feature = "native-activity", feature = "game-activity"))]
 pub use activity_impl::set_nonblocking_callbacks;
 
 /// An application event delivered during [`AndroidApp::poll_events`]

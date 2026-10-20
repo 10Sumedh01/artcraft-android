@@ -1,9 +1,34 @@
-use std::{iter::FusedIterator, marker::PhantomData, ptr::NonNull};
+use std::{ffi::CStr, iter::FusedIterator, marker::PhantomData, ptr::NonNull, sync::OnceLock};
 
 use crate::input::{
     Axis, Button, ButtonState, EdgeFlags, KeyAction, Keycode, MetaState, MotionAction,
     MotionEventFlags, Pointer, PointersIter, Source, ToolType,
 };
+
+/// The `AMotionEvent_getActionButton` entry point of `libandroid.so`.
+///
+/// This was only added in Android 13 (API level 33), but `ndk-sys` declares it unconditionally and
+/// links against it directly. A direct reference leaves the symbol undefined in our `cdylib`, so
+/// `dlopen` fails with `UnsatisfiedLinkError: cannot locate symbol "AMotionEvent_getActionButton"`
+/// on Android 12 and older. Resolve it at runtime instead and fall back to "no button" (which is
+/// what those older platforms reported anyway) when the symbol is absent.
+type ActionButtonFn = unsafe extern "C" fn(*const ndk_sys::AInputEvent) -> i32;
+
+fn action_button_fn() -> Option<ActionButtonFn> {
+    static ACTION_BUTTON: OnceLock<Option<ActionButtonFn>> = OnceLock::new();
+    *ACTION_BUTTON.get_or_init(|| {
+        // `RTLD_DEFAULT` searches the global symbol scope, which is where `libandroid.so` lives
+        // for an application process. Use `mem::transmute` (not a cast) since the signature is
+        // not `extern "C" fn()`.
+        let name = CStr::from_bytes_with_nul(b"AMotionEvent_getActionButton\0").unwrap();
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if sym.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute::<*mut libc::c_void, ActionButtonFn>(sym) })
+        }
+    })
+}
 
 /// A motion event
 ///
@@ -68,8 +93,15 @@ impl MotionEvent<'_> {
     /// See [the MotionEvent docs](https://developer.android.com/reference/android/view/MotionEvent#getActionButton())
     #[inline]
     pub fn action_button(&self) -> Button {
-        let action_button =
-            unsafe { ndk_sys::AMotionEvent_getActionButton(self.ndk_event.ptr().as_ptr()) as u32 };
+        // Resolved at runtime: the symbol only exists on Android 13 (API level 33) and newer.
+        // See `action_button_fn` for why we cannot call `ndk_sys::AMotionEvent_getActionButton`
+        // directly.
+        let action_button = match action_button_fn() {
+            Some(get_action_button) => unsafe {
+                get_action_button(self.ndk_event.ptr().as_ptr()) as u32
+            },
+            None => 0,
+        };
         action_button.into()
     }
 

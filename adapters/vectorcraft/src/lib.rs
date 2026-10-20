@@ -787,6 +787,7 @@ impl eframe::App for VectorCraftAndroidApp {
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
     log::info!("{SAF_BRIDGE_MARKER} ready; {ANDROID_SHELL_MARKER}; {}", ime_bridge::ime::IME_MARKER);
+    egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
     install_persist_env(&android_app);
     system_fonts::install_font_env(&android_app);
     let bridge = match AndroidFileBridge::new(android_app.clone()) {

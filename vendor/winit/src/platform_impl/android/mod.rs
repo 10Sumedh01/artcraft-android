@@ -196,6 +196,11 @@ impl<T: 'static> EventLoop<T> {
             "An `AndroidApp` as passed to android_main() is required to create an `EventLoop` on \
              Android",
         );
+        // Enable the scroll axes for the GameActivity backend: unlike the
+        // NativeActivity InputQueue, GameActivity only fills `axisValues` for
+        // axes enabled here (X and Y by default), so the mouse wheel reads 0.
+        android_app.enable_motion_axis(Axis::Vscroll);
+        android_app.enable_motion_axis(Axis::Hscroll);
         let redraw_flag = SharedFlag::new();
 
         Ok(Self {

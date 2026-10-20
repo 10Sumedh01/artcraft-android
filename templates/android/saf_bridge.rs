@@ -5,7 +5,7 @@
 // destination URI. This module is the Rust side: it drives the picker over JNI and polls answers
 // once per frame. The upstream ArtCraft crates are never modified.
 //
-// ARTCRAFT_ANDROID_SAF_BRIDGE_V2
+// ARTCRAFT_ANDROID_SAF_BRIDGE_V3
 mod saf {
     use android_activity::AndroidApp;
     use jni::{
@@ -19,7 +19,7 @@ mod saf {
 
     /// Emitted at startup so a device log (and the packaged `.so` strings) can confirm this shell —
     /// including the SAF file bridge — is the one running.
-    pub const SAF_MARKER: &str = "ARTCRAFT_ANDROID_SAF_BRIDGE_V2";
+    pub const SAF_MARKER: &str = "ARTCRAFT_ANDROID_SAF_BRIDGE_V3";
 
     /// How long a synchronous picker waits for the user before giving up (the app carries on as if
     /// the dialog was cancelled; the SAF picker itself has no timeout).
@@ -149,6 +149,35 @@ mod saf {
                     let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
                     env.call_method(&*activity, jni_str!("safRequestFolder"), jni_sig!("(J)V"), &[JValue::Long(id as i64)])?;
                     Ok(())
+                })
+                .map_err(|e| e.to_string())
+        }
+
+        /// Hand a generated PDF to Android's print system (the native print spooler). Java answers
+        /// synchronously — `"OK"` once the print dialog has been queued on the main thread, or
+        /// `"ERROR: …"` when no print service exists — so the caller gets its receipt (or failure)
+        /// inside the same frame while the dialog itself opens asynchronously.
+        pub fn print_document(&self, title: &str, pdf: &[u8]) -> Result<String, String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<String> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it.
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    let title_obj = JObject::from(env.new_string(title)?);
+                    let bytes_obj = JObject::from(env.byte_array_from_slice(pdf)?);
+                    let value = env
+                        .call_method(
+                            &*activity,
+                            jni_str!("printDocument"),
+                            jni_sig!("(Ljava/lang/String;[B)Ljava/lang/String;"),
+                            &[JValue::Object(&title_obj), JValue::Object(&bytes_obj)],
+                        )?
+                        .l()?;
+                    if value.is_null() {
+                        return Ok(String::new());
+                    }
+                    let value = JString::cast_local(env, value)?;
+                    value.try_to_string(env)
                 })
                 .map_err(|e| e.to_string())
         }

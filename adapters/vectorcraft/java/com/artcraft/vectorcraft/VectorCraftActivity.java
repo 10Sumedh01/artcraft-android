@@ -1,6 +1,5 @@
 package com.artcraft.vectorcraft;
 
-import android.app.NativeActivity;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -25,6 +24,8 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 
+import com.google.androidgamesdk.GameActivity;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -42,9 +43,10 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
- * NativeActivity subclass that supplies Android Storage Access Framework (SAF) open/save results to
+ * GameActivity subclass that supplies Android Storage Access Framework (SAF) open/save results to
  * the Rust UI shell for VectorCraft.
  *
  * <p>Documents the user picks are staged as ordinary files under the app's external {@code media}
@@ -53,7 +55,7 @@ import java.util.concurrent.Executors;
  * against the chosen SAF URI, and {@link #vcCommitIfMapped(String)} copies the staged bytes back
  * through ContentResolver after every write.
  */
-public final class VectorCraftActivity extends NativeActivity {
+public final class VectorCraftActivity extends GameActivity {
     private static final String TAG = "VectorCraftSAF";
     private static final int REQ_OPEN = 0x5643;
     private static final int REQ_SAVE = 0x5644;
@@ -64,10 +66,11 @@ public final class VectorCraftActivity extends NativeActivity {
     private final Map<Long, String> suggestedNames = new HashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
 
-    // Soft-keyboard host. A bare NativeActivity has no editable view, so the system IME opens
-    // unreliably and delivers no text. This tiny, invisible but focusable EditText has a real
-    // InputConnection, so the keyboard shows/dismisses on request and every commit/composition
-    // arrives here where imePoll() hands it to the Rust shell as egui IME events.
+    // Soft-keyboard host. GameActivity, like the NativeActivity it replaces, has no editable
+    // view for the system IME, so the keyboard opens unreliably and delivers no text. This
+    // tiny, invisible but focusable EditText has a real InputConnection, so the keyboard
+    // shows/dismisses on request and every commit/composition arrives here where imePoll()
+    // hands it to the Rust shell as egui IME events.
     private final ConcurrentLinkedQueue<String> imeEvents = new ConcurrentLinkedQueue<>();
     private EditText imeView;
     // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
@@ -147,6 +150,31 @@ public final class VectorCraftActivity extends NativeActivity {
         setIntent(intent);
         applyImmersiveFullscreen();
         handleIncomingFiles(intent);
+    }
+
+    /**
+     * On a real finish, end the process instead of running GameActivity's teardown: the game
+     * glue's destroy handshake waits for the Rust thread to acknowledge the destroy, which
+     * winit's Android backend doesn't do once eframe's loop has stopped -- the main thread
+     * would hang there, and every later launch in this process with it, since winit's event
+     * loop cannot be created twice in one process. Staged file copies get a moment to land
+     * before the process goes.
+     */
+    @Override
+    protected void onDestroy() {
+        if (isFinishing()) {
+            io.shutdown();
+            try {
+                if (!io.awaitTermination(20, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "staged copies still copying after 20 s; ending anyway");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            Log.i(TAG, "finished; ending the process");
+            android.os.Process.killProcess(android.os.Process.myPid());
+        }
+        super.onDestroy();
     }
 
     @Override

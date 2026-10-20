@@ -679,6 +679,7 @@ impl eframe::App for PhotoCraftAndroidApp {
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
     log::info!("{ANDROID_SHELL_MARKER} ready; {}", ime_bridge::ime::IME_MARKER);
+    egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
     system_fonts::install_font_env(&android_app);
     let bridge = match AndroidFileBridge::new(android_app.clone()) {
         Ok(bridge) => bridge,
@@ -702,13 +703,22 @@ fn android_main(android_app: AndroidApp) {
     }
     let picker = Arc::new(PickerState::default());
     let intent_inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PhotoCraft")
             .with_drag_and_drop(true),
+        renderer: eframe::Renderer::Wgpu,
         android_app: Some(android_app),
         ..Default::default()
     };
+    // The adapter's real texture and buffer limits, so large documents stay on the GPU canvas;
+    // Vulkan first, GLES on devices without a usable Vulkan driver — the same setup the desktop
+    // app and the generated launchers use.
+    photocraft_ui_egui::gpu_canvas::use_adapter_limits(&mut options.wgpu_options.wgpu_setup);
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {
+        create.instance_descriptor.backends =
+            eframe::wgpu::Backends::VULKAN | eframe::wgpu::Backends::GL;
+    }
     let app_bridge = bridge.clone_for_services();
     let app_picker = picker.clone();
     let app_intent_inbox = intent_inbox.clone();
@@ -717,7 +727,7 @@ fn android_main(android_app: AndroidApp) {
         options,
         Box::new(move |cc| {
             PhotocraftApp::setup_context(&cc.egui_ctx, photocraft_ui_egui::theme::ThemeKind::Pro);
-            let app = PhotocraftApp::new(
+            let mut app = PhotocraftApp::new(
                 Session::new(),
                 services(
                     app_bridge.clone_for_services(),
@@ -726,6 +736,17 @@ fn android_main(android_app: AndroidApp) {
                     app_intent_inbox.clone(),
                 ),
             );
+            // Hand the canvas the live render state when the device is a real GPU, and record the
+            // adapter for Help › System Info either way — without this the canvas stays on the CPU
+            // compositor and System Info reports no adapter ("unknown").
+            if let Some(rs) = cc.wgpu_render_state.clone() {
+                let info = rs.adapter.get_info();
+                log::info!("wgpu adapter: {} ({:?})", info.name, info.backend);
+                app.perf.gpu_info.set_adapter(&info);
+                if info.device_type != eframe::wgpu::DeviceType::Cpu {
+                    app.set_wgpu(rs);
+                }
+            }
             Ok(Box::new(PhotoCraftAndroidApp {
                 inner: app,
                 bridge: app_bridge.clone_for_services(),

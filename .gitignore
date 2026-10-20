@@ -14,6 +14,9 @@ backups/
 # Held by lib/build-common.sh while a build is running (one build at a time)
 .artcraft-build.lock
 
+# Gradle JDK the builder downloads when no suitable one is installed (lib/build-common.sh)
+.cache/
+
 # Python bytecode caches
 __pycache__/
 *.pyc
