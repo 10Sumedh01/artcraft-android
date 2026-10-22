@@ -14,6 +14,7 @@ import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.print.PageRange;
 import android.print.PrintAttributes;
 import android.print.PrintDocumentAdapter;
@@ -89,6 +90,8 @@ public final class __CLASS__ extends GameActivity {
     private EditText imeView;
     // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
     private volatile boolean imeWanted = false;
+    // Some IMEs call both deleteSurroundingText and sendKeyEvent for backspace; queue only one.
+    private volatile long lastImeDeleteAt = 0L;
 
     // Files the system handed us because this app is registered for their type (the ACTION_VIEW that
     // launched or re-focused the app, or an ACTION_SEND share). Each is copied into app-private
@@ -460,6 +463,11 @@ public final class __CLASS__ extends GameActivity {
                         @Override
                         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                             if (beforeLength > 0 || afterLength > 0) {
+                                long now = android.os.SystemClock.uptimeMillis();
+                                if (now - lastImeDeleteAt < 150) {
+                                    return super.deleteSurroundingText(beforeLength, afterLength);
+                                }
+                                lastImeDeleteAt = now;
                                 queueImeEvent("d" + beforeLength + "," + afterLength);
                             }
                             return super.deleteSurroundingText(beforeLength, afterLength);
@@ -476,8 +484,18 @@ public final class __CLASS__ extends GameActivity {
                             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                                 int code = event.getKeyCode();
                                 if (code == KeyEvent.KEYCODE_DEL) {
+                                    long now = android.os.SystemClock.uptimeMillis();
+                                    if (now - lastImeDeleteAt < 150) {
+                                        return super.sendKeyEvent(event);
+                                    }
+                                    lastImeDeleteAt = now;
                                     queueImeEvent("d1,0");
                                 } else if (code == KeyEvent.KEYCODE_FORWARD_DEL) {
+                                    long now = android.os.SystemClock.uptimeMillis();
+                                    if (now - lastImeDeleteAt < 150) {
+                                        return super.sendKeyEvent(event);
+                                    }
+                                    lastImeDeleteAt = now;
                                     queueImeEvent("d0,1");
                                 } else if (code == KeyEvent.KEYCODE_ENTER) {
                                     queueImeEvent("a6");

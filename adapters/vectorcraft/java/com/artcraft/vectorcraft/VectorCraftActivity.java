@@ -10,6 +10,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
@@ -82,6 +83,8 @@ public final class VectorCraftActivity extends GameActivity {
     private EditText imeView;
     // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
     private volatile boolean imeWanted = false;
+    // Some IMEs call both deleteSurroundingText and sendKeyEvent for backspace; queue only one.
+    private volatile long lastImeDeleteAt = 0L;
 
     // Documents the system asked this app to open (an ACTION_VIEW/ACTION_SEND it is registered for):
     // the private path of each staged copy, drained one per call by the Rust shell through
@@ -341,6 +344,11 @@ public final class VectorCraftActivity extends GameActivity {
                         @Override
                         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                             if (beforeLength > 0 || afterLength > 0) {
+                                long now = android.os.SystemClock.uptimeMillis();
+                                if (now - lastImeDeleteAt < 150) {
+                                    return super.deleteSurroundingText(beforeLength, afterLength);
+                                }
+                                lastImeDeleteAt = now;
                                 queueImeEvent("d" + beforeLength + "," + afterLength);
                             }
                             return super.deleteSurroundingText(beforeLength, afterLength);
@@ -357,8 +365,18 @@ public final class VectorCraftActivity extends GameActivity {
                             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                                 int code = event.getKeyCode();
                                 if (code == KeyEvent.KEYCODE_DEL) {
+                                    long now = android.os.SystemClock.uptimeMillis();
+                                    if (now - lastImeDeleteAt < 150) {
+                                        return super.sendKeyEvent(event);
+                                    }
+                                    lastImeDeleteAt = now;
                                     queueImeEvent("d1,0");
                                 } else if (code == KeyEvent.KEYCODE_FORWARD_DEL) {
+                                    long now = android.os.SystemClock.uptimeMillis();
+                                    if (now - lastImeDeleteAt < 150) {
+                                        return super.sendKeyEvent(event);
+                                    }
+                                    lastImeDeleteAt = now;
                                     queueImeEvent("d0,1");
                                 } else if (code == KeyEvent.KEYCODE_ENTER) {
                                     queueImeEvent("a6");
