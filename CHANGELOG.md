@@ -3,6 +3,21 @@
 ## v37 — 2026-10-20
 
 ### Fixed
+- Typing on the soft keyboard lagged by up to half a second — a backspace above all: the letter
+  stayed until the next scheduled frame. The keyboard's events are queued by the Activity and
+  drained by the shell once per frame, but the shell's loop sleeps in `ALooper_pollOnce` while
+  nothing touches the screen, and a queued event is not an input event: the loop woke only when
+  egui's cursor blink came round (half a second) or the user touched the screen. Every queued
+  keyboard event now wakes the loop the way an input event does — through `GameActivity.onKeyDown`,
+  whose native glue calls `ALooper_wake` — with a `KEYCODE_UNKNOWN` event that winit reads as
+  `Key::Unidentified` and no widget acts on. The character goes in the frame the key went down.
+- A machine with no Android SDK could not build at all: the builder looked for one in
+  `ANDROID_HOME` (or `~/Android/Sdk`) and stopped with "Android SDK platform directory not
+  found". The builder now keeps its own SDK in `android-sdk/` beside the other build state and
+  fetches it when the machine has none — the command-line tools (which carry `sdkmanager`), the
+  compile platform and the build tools. An SDK that is already on the machine is used where it
+  lies, and an NDK that is already installed is never fetched twice: it is a gigabyte unpacked,
+  and the NDK is not tied to an SDK root.
 - The first launch on a phone-class screen did not raise the interface to 150% in most apps, only in
   PhotoCraft. The launcher asks the Activity whether the device is a phone-class screen
   (`smallestScreenWidthDp < 600`, Android's own `sw600dp` boundary) over JNI, and the shared

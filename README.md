@@ -98,6 +98,8 @@ The Gradle project, `AndroidManifest.xml` and the `Theme.AppCompat` theme are re
 
 Gradle needs a JDK in the 17–23 range. The builder uses the first one it finds on the machine and, when there is none, downloads Temurin JDK 21 into `.cache/jdk/` once. The signing keystore itself keeps being created with the system `keytool`.
 
+The Android SDK is found the same way: the builder uses the first one that has the compile platform and the build tools — `ANDROID_HOME`, `ANDROID_SDK_ROOT`, its own `android-sdk/`, `~/Android/Sdk`, `/opt/android-sdk` — and when the machine has none, it fetches one into `android-sdk/` (the command-line tools, the platform and the build tools, with the licences accepted). The NDK is looked for across every SDK on the machine and is only downloaded when there is none at all: it is a gigabyte unpacked, and it does not have to live in the SDK root. `ARTCRAFT_SDK_DIR`, `ARTCRAFT_TARGET_SDK`, `ARTCRAFT_BUILD_TOOLS_VERSION` and `ARTCRAFT_NDK_VERSION` override the choices.
+
 ## Porting model and adapter boundary
 
 The generic launcher targets native Rust/egui applications that expose `Session`, `Services`, and a public `*App` type from `crates/engine` and `crates/ui-egui`.
@@ -143,6 +145,8 @@ PdfCraft's interface fallback — an *installed* face, read at runtime and never
 The Android soft keyboard is wired into every app. Each Activity installs an invisible, focusable `EditText`; its `InputConnection` controls keyboard visibility and forwards text commits, composition updates, deletions, and Enter to the Rust shell. The shell converts these into egui input-method events for the currently focused text field.
 
 The keyboard overlays the fullscreen native surface rather than resizing it.
+
+Because the events are queued in the Activity and read by the shell once per frame, every queued event also wakes the shell's loop: the loop otherwise sleeps in `ALooper_pollOnce` until something touches the screen, so a backspace would wait for the next repaint (egui's cursor blink, up to half a second) before the character went away. The wake goes through `GameActivity.onKeyDown` — whose native glue calls `ALooper_wake` — carrying a `KEYCODE_UNKNOWN` event, which winit reports as `Key::Unidentified` and no widget acts on.
 
 ### Edge-to-edge display
 

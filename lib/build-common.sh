@@ -286,18 +286,122 @@ PY
     echo "Verified the Android file bridge: $pkg.$activity launches the app and is compiled into the APK."
 }
 
-say 2 "Finding Android SDK and NDK (read-only; project files stay under $ROOT)..."
-SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
-[[ -d "$SDK/platforms" ]] || fail "Android SDK platform directory not found: $SDK/platforms. Set ANDROID_HOME to your SDK."
+# ---- The Android SDK -------------------------------------------------------------------------
+# The builder keeps its own SDK in `android-sdk/`, beside the other build state, and fetches it
+# when the machine has none: the command-line tools (which carry `sdkmanager`), the compile
+# platform, the build tools, and the NDK. An SDK that is already on the machine is used where it
+# lies, and an NDK that is already installed is never fetched twice — it is a gigabyte unpacked.
+#
+# The NDK is not tied to an SDK root (it is named through `ANDROID_NDK_HOME`), so the search for
+# one reaches every SDK on the machine, not only the chosen root.
+
+# The SDK root to use: the first candidate that holds the compile platform and some build tools.
+# The builder's own `android-sdk/` is where a missing one is fetched to, and the machine's own
+# SDKs are searched as well, so a machine that already has one does not download a second.
+find_android_sdk() {
+    local dir
+    for dir in "${ARTCRAFT_SDK_DIR:-}" "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+               "$ROOT/android-sdk" "$HOME"/Android*/Sdk /opt/android-sdk; do
+        [[ -n "$dir" && -d "$dir/platforms/android-$TARGET_SDK" && -d "$dir/build-tools" ]] || continue
+        printf '%s\n' "$dir"
+        return 0
+    done
+    printf '%s\n' "$ROOT/android-sdk"
+}
+
+# An NDK on the machine, wherever it lies.
+find_android_ndk() {
+    local dir
+    for dir in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${NDK_HOME:-}" \
+               "$ROOT/android-sdk/ndk"/* /opt/android-sdk/ndk/* "$HOME"/Android*/Sdk/ndk/*; do
+        [[ -n "$dir" && -d "$dir/toolchains/llvm/prebuilt" ]] || continue
+        printf '%s\n' "$dir"
+        return 0
+    done
+    return 1
+}
+
+# The newest command-line tools package for Linux, from Google's own repository index. The
+# archive carries `sdkmanager`, which installs the platform, the build tools and the NDK.
+android_cmdline_tools_url() {
+    python3 - <<'PY'
+import re
+import urllib.request
+
+best = 0
+for index in ("repository2-3.xml", "repository2-1.xml"):
+    try:
+        with urllib.request.urlopen(
+            f"https://dl.google.com/android/repository/{index}", timeout=60
+        ) as response:
+            data = response.read().decode("utf-8", "replace")
+    except Exception:
+        continue
+    for number in re.findall(r"commandlinetools-linux-(\d+)_latest\.zip", data):
+        best = max(best, int(number))
+if best:
+    print(f"https://dl.google.com/android/repository/commandlinetools-linux-{best}_latest.zip")
+PY
+}
+
+# Fetch what the SDK is missing: the command-line tools, the compile platform, the build tools,
+# and — when the machine has no NDK at all — the NDK as well.
+ensure_android_sdk() {
+    local sdk="$1" ndk_package="${2:-}" java_home tmp url
+    mkdir -p "$sdk"
+    if [[ ! -x "$sdk/cmdline-tools/latest/bin/sdkmanager" ]]; then
+        say 2 "  -> fetching the Android command-line tools into $sdk"
+        tmp="$(mktemp -d "$sdk/.cmdline-tools.XXXXXX")"
+        url="$(android_cmdline_tools_url)"
+        [[ -n "$url" ]] || { rm -rf "$tmp"; fail "Could not find the Android command-line tools. Set ANDROID_HOME to an SDK with them."; }
+        curl -fL --retry 3 -o "$tmp/tools.zip" "$url" \
+            || { rm -rf "$tmp"; fail "Could not download the Android command-line tools from $url."; }
+        python3 - "$tmp/tools.zip" "$tmp" <<'PY' || { rm -rf "$tmp"; fail "The downloaded command-line tools archive could not be extracted."; }
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    archive.extractall(sys.argv[2])
+PY
+        [[ -d "$tmp/cmdline-tools" ]] || { rm -rf "$tmp"; fail "The downloaded command-line tools archive is missing the cmdline-tools folder."; }
+        mkdir -p "$sdk/cmdline-tools"
+        rm -rf "$sdk/cmdline-tools/latest"
+        mv "$tmp/cmdline-tools" "$sdk/cmdline-tools/latest"
+        rm -rf "$tmp"
+        # The archive is unpacked with python, which keeps no permissions: `sdkmanager` and its
+        # companions have to be made executable again.
+        chmod +x "$sdk/cmdline-tools/latest/bin/"* 2>/dev/null || true
+    fi
+    # `sdkmanager` is a Java program, so it needs a JDK: the one Gradle uses, or a fetched one.
+    java_home="$(find_gradle_jdk || bootstrap_gradle_jdk)"
+    local sdkmanager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+    # The licences are asked for once: without them the packages are refused.
+    yes | JAVA_HOME="$java_home" "$sdkmanager" --sdk_root="$sdk" --licenses >/dev/null 2>&1 || true
+    say 2 "  -> installing the Android platform, the build tools${ndk_package:+ and the NDK}"
+    JAVA_HOME="$java_home" "$sdkmanager" --sdk_root="$sdk" \
+        "platform-tools" "platforms;android-$TARGET_SDK" "build-tools;$BUILD_TOOLS_VERSION" $ndk_package \
+        || fail "Could not install the Android SDK packages into $sdk."
+}
+
+say 2 "Finding Android SDK and NDK (the builder's own SDK lives in $ROOT/android-sdk)..."
 TARGET_SDK="${ARTCRAFT_TARGET_SDK:-35}"
+BUILD_TOOLS_VERSION="${ARTCRAFT_BUILD_TOOLS_VERSION:-37.0.0}"
+NDK_VERSION="${ARTCRAFT_NDK_VERSION:-27.2.12479018}"
+SDK="$(find_android_sdk)"
+NDK="$(find_android_ndk || true)"
+if [[ ! -d "$SDK/platforms/android-$TARGET_SDK" || ! -d "$SDK/build-tools" || -z "$NDK" ]]; then
+    # Something is missing. The builder's own folder is where it is fetched to, so a machine
+    # without an SDK ends up with one that needs no setup at all.
+    SDK="$ROOT/android-sdk"
+    NDK_PACKAGE=""
+    [[ -n "$NDK" ]] || NDK_PACKAGE="ndk;$NDK_VERSION"
+    ensure_android_sdk "$SDK" "$NDK_PACKAGE"
+    [[ -n "$NDK" ]] || NDK="$SDK/ndk/$NDK_VERSION"
+fi
 [[ -d "$SDK/platforms/android-$TARGET_SDK" ]] || fail "Android SDK platform android-$TARGET_SDK not found under $SDK/platforms. Install it with sdkmanager or set ARTCRAFT_TARGET_SDK to an installed platform."
 [[ -d "$SDK/build-tools" ]] || fail "Android build-tools directory missing under $SDK."
 BUILD_TOOLS="${ARTCRAFT_BUILD_TOOLS_VERSION:-$(find "$SDK/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n 1)}"
 [[ -n "$BUILD_TOOLS" && -d "$SDK/build-tools/$BUILD_TOOLS" ]] || fail "No usable Android Build Tools installation found."
-NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK_HOME:-}}}"
-if [[ -z "$NDK" || ! -d "$NDK" ]]; then
-    NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -V | tail -n 1 || true)"
-fi
 [[ -n "$NDK" && -d "$NDK" ]] || fail "No Android NDK found. Install one using Android SDK Manager."
 export ANDROID_HOME="$SDK" ANDROID_SDK_ROOT="$SDK"
 export ANDROID_NDK_HOME="$NDK" ANDROID_NDK_ROOT="$NDK" NDK_HOME="$NDK"
@@ -439,7 +543,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "43"
+GENERATOR_VERSION = "45"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.

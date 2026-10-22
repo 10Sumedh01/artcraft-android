@@ -321,34 +321,34 @@ public final class VectorCraftActivity extends GameActivity {
                         @Override
                         public boolean commitText(CharSequence text, int newCursorPosition) {
                             if (text != null && text.length() > 0) {
-                                imeEvents.offer("c" + text);
+                                queueImeEvent("c" + text);
                             }
                             return super.commitText(text, newCursorPosition);
                         }
 
                         @Override
                         public boolean setComposingText(CharSequence text, int newCursorPosition) {
-                            imeEvents.offer("p" + (text == null ? "" : text.toString()));
+                            queueImeEvent("p" + (text == null ? "" : text.toString()));
                             return super.setComposingText(text, newCursorPosition);
                         }
 
                         @Override
                         public boolean finishComposingText() {
-                            imeEvents.offer("f");
+                            queueImeEvent("f");
                             return super.finishComposingText();
                         }
 
                         @Override
                         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                             if (beforeLength > 0 || afterLength > 0) {
-                                imeEvents.offer("d" + beforeLength + "," + afterLength);
+                                queueImeEvent("d" + beforeLength + "," + afterLength);
                             }
                             return super.deleteSurroundingText(beforeLength, afterLength);
                         }
 
                         @Override
                         public boolean performEditorAction(int actionCode) {
-                            imeEvents.offer("a" + actionCode);
+                            queueImeEvent("a" + actionCode);
                             return super.performEditorAction(actionCode);
                         }
 
@@ -357,11 +357,11 @@ public final class VectorCraftActivity extends GameActivity {
                             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                                 int code = event.getKeyCode();
                                 if (code == KeyEvent.KEYCODE_DEL) {
-                                    imeEvents.offer("d1,0");
+                                    queueImeEvent("d1,0");
                                 } else if (code == KeyEvent.KEYCODE_FORWARD_DEL) {
-                                    imeEvents.offer("d0,1");
+                                    queueImeEvent("d0,1");
                                 } else if (code == KeyEvent.KEYCODE_ENTER) {
-                                    imeEvents.offer("a6");
+                                    queueImeEvent("a6");
                                 }
                             }
                             return super.sendKeyEvent(event);
@@ -468,6 +468,35 @@ public final class VectorCraftActivity extends GameActivity {
                 Log.w(TAG, "Could not hide the soft keyboard", error);
             }
         });
+    }
+
+    /**
+     * Queue one keyboard event for the Rust shell, and wake the native loop so the same frame
+     * reads it.
+     *
+     * The native loop (android-activity, then winit and eframe) sleeps in ALooper_pollOnce until
+     * something arrives, and from here only an input event on its own queue can wake it. A queued
+     * keyboard event is not an input event: it would wait in this queue until the loop next woke
+     * for another reason — the next frame timer, a touch, or egui's cursor blink, up to half a
+     * second later — which is the lag felt between a backspace and the character going away.
+     *
+     * GameActivity.onKeyDown hands a key event to the native queue (onKeyDownNative, whose glue
+     * calls ALooper_wake), so it is what wakes the loop. KEYCODE_UNKNOWN reaches winit as
+     * Key::Unidentified, which no widget acts on: the app sees a wake-up and nothing else. Both
+     * the press and the release go, or the key would look held down.
+     */
+    private void queueImeEvent(String event) {
+        imeEvents.offer(event);
+        try {
+            super.onKeyDown(
+                    KeyEvent.KEYCODE_UNKNOWN,
+                    new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN));
+            super.onKeyUp(
+                    KeyEvent.KEYCODE_UNKNOWN,
+                    new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_UNKNOWN));
+        } catch (Throwable error) {
+            Log.w(TAG, "Could not wake the native loop for a keyboard event", error);
+        }
     }
 
     /**
