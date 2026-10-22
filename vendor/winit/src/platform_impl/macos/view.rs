@@ -40,7 +40,10 @@ struct CursorState {
 
 impl Default for CursorState {
     fn default() -> Self {
-        Self { visible: true, cursor: default_cursor() }
+        Self {
+            visible: true,
+            cursor: default_cursor(),
+        }
     }
 }
 
@@ -832,11 +835,16 @@ impl WinitView {
         // (which is incompatible with `frameDidChange:`)
         //
         // unsafe { msg_send_id![self, window] }
-        self.ivars()._ns_window.load().expect("view to have a window")
+        self.ivars()
+            ._ns_window
+            .load()
+            .expect("view to have a window")
     }
 
     fn queue_event(&self, event: WindowEvent) {
-        self.ivars().app_delegate.maybe_queue_window_event(self.window().id(), event);
+        self.ivars()
+            .app_delegate
+            .maybe_queue_window_event(self.window().id(), event);
     }
 
     fn scale_factor(&self) -> f64 {
@@ -967,8 +975,9 @@ impl WinitView {
                 let location_mask = ModLocationMask::from_location(event.location);
 
                 let mut phys_mod_state = self.ivars().phys_modifiers.borrow_mut();
-                let phys_mod =
-                    phys_mod_state.entry(logical_key).or_insert(ModLocationMask::empty());
+                let phys_mod = phys_mod_state
+                    .entry(logical_key)
+                    .or_insert(ModLocationMask::empty());
 
                 let is_active = current_modifiers.state().contains(event_modifier);
                 let mut events = VecDeque::with_capacity(2);
@@ -1118,7 +1127,9 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
 
     if ignore_alt_characters {
         let ns_chars = unsafe {
-            event.charactersIgnoringModifiers().expect("expected characters to be non-null")
+            event
+                .charactersIgnoringModifiers()
+                .expect("expected characters to be non-null")
         };
 
         unsafe {

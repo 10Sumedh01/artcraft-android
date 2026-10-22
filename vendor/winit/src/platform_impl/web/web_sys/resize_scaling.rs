@@ -235,8 +235,10 @@ impl ResizeScaleInternal {
                 .to_physical(backend::scale_factor(&self.window));
         }
 
-        let entry: ResizeObserverSize =
-            entry.device_pixel_content_box_size().get(0).unchecked_into();
+        let entry: ResizeObserverSize = entry
+            .device_pixel_content_box_size()
+            .get(0)
+            .unchecked_into();
 
         let writing_mode = self.style.get("writing-mode");
 
@@ -252,14 +254,14 @@ impl ResizeScaleInternal {
             _ if writing_mode.starts_with("horizontal") => true,
             _ if writing_mode.starts_with("vertical") | writing_mode.starts_with("sideways") => {
                 false
-            },
+            }
             // deprecated values
             "lr" | "lr-tb" | "rl" => true,
             "tb" | "tb-lr" | "tb-rl" => false,
             _ => {
                 warn!("unrecognized `writing-mode`, assuming horizontal");
                 true
-            },
+            }
         };
 
         if horizontal {

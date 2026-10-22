@@ -17,8 +17,8 @@ use std::iter::FusedIterator;
 
 use super::ffi::{self, GameActivityKeyEvent, GameActivityMotionEvent};
 use crate::input::{
-    Axis, Button, ButtonState, EdgeFlags, KeyAction, KeyEventFlags, Keycode, MetaState,
-    MotionAction, MotionEventFlags, Pointer, PointersIter, Source, ToolType,
+    Axis, Button, ButtonState, Classification, EdgeFlags, KeyAction, KeyEventFlags, Keycode,
+    MetaState, MotionAction, MotionEventFlags, Pointer, PointersIter, Source, ToolType,
 };
 
 // Note: try to keep this wrapper API compatible with the AInputEvent API if possible
@@ -52,6 +52,19 @@ impl<'a> MotionEvent<'a> {
     pub fn source(&self) -> Source {
         let source = self.ga_event.source as u32;
         source.into()
+    }
+
+    /// Get the classification of the gesture the event belongs to.
+    ///
+    /// A hardware touchpad's gestures are reported as motion events with a
+    /// classification: a two-finger slide is a swipe, a two-finger pinch is a pinch, and
+    /// a tap is neither. It is what tells a gesture apart from a plain press.
+    ///
+    /// See [the MotionEvent docs](https://developer.android.com/reference/android/view/MotionEvent#getClassification()).
+    #[inline]
+    pub fn classification(&self) -> Classification {
+        let classification = self.ga_event.classification as u32;
+        classification.into()
     }
 
     /// Get the device id associated with the event.

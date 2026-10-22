@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use android_activity::input::{
-    Axis, Button, InputEvent, KeyAction, Keycode, MotionAction, Source, ToolType,
+    Axis, Button, Classification, InputEvent, KeyAction, Keycode, MotionAction, ToolType,
 };
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
@@ -27,6 +27,7 @@ use crate::window::{
     WindowButtons, WindowLevel,
 };
 
+mod device_kind;
 mod keycodes;
 
 pub(crate) use crate::cursor::{
@@ -40,21 +41,76 @@ static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 /// equates to an infinite timeout, not a zero timeout (so can't just use
 /// `Option::min`)
 fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
-    a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
+    a.map_or(b, |a_timeout| {
+        b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout)))
+    })
 }
 
-/// Above this a scroll axis value is a point-like (smooth trackpad) amount rather than a number of
-/// wheel notches. egui multiplies `LineDelta` by `line_scroll_speed` (40 points per line), which is
-/// right for a mouse's ±1-per-notch report and far too fast for a trackpad's larger amounts.
-const MAX_LINE_SCROLL: f32 = 3.0;
+/// Points a smooth scroll amount is worth per axis unit. egui's line scroll speed is 40 points per
+/// line and a mouse notch is worth a line, so an amount that is counted in notches is converted
+/// with the same number.
+///
+/// A hardware touchpad does not need it: Android reports its gesture in pixels, and those are
+/// the pixels the content moves by.
+const POINTS_PER_AXIS: f64 = 40.0;
 
-/// egui's line scroll speed in points: pixel-style scroll deltas (from smooth/trackpad amounts
-/// reported by `MotionAction::Scroll`) are converted with this so they feel the same as the
-/// `LineDelta` path.
-const POINTS_PER_LINE: f32 = 40.0;
+/// How far the two fingers' midpoint must move (physical pixels) before a two-finger gesture
+/// counts as a pan (a scroll) rather than staying undecided.
+const PAN_DEADZONE_PX: f64 = 12.0;
+
+/// How far the two fingers' spread must change (physical pixels) before a two-finger gesture can
+/// be a pinch (a zoom) rather than a pan.
+const PINCH_DEADZONE_PX: f64 = 36.0;
+
+/// How much more the two fingers' spread must change than their midpoint moves for a pinch to win
+/// the gesture. A pan holds the fingers a fixed distance apart while the pair slides; a pinch
+/// mostly changes the distance. Well above 1, so a slightly uneven drag still scrolls.
+const PINCH_SPREAD_RATIO: f64 = 1.5;
+
+/// How much faster a two-finger pan scrolls than the fingers move.
+const PAN_SPEED: f64 = 1.5;
 
 fn pointer_position(pointer: &android_activity::input::Pointer<'_>) -> PhysicalPosition<f64> {
-    PhysicalPosition { x: pointer.x() as f64, y: pointer.y() as f64 }
+    PhysicalPosition {
+        x: pointer.x() as f64,
+        y: pointer.y() as f64,
+    }
+}
+
+/// The distance between the first two pointers of a motion event, if it has two.
+fn pointer_spread(motion_event: &android_activity::input::MotionEvent<'_>) -> Option<f64> {
+    let mut pointers = motion_event.pointers().map(|pointer| pointer_position(&pointer));
+    let first = pointers.next()?;
+    let second = pointers.next()?;
+    Some(((first.x - second.x).powi(2) + (first.y - second.y).powi(2)).sqrt())
+}
+
+/// Every finger currently reported by `motion_event`, as (id, position).
+fn collect_touch_points(
+    motion_event: &android_activity::input::MotionEvent<'_>,
+) -> Vec<(i32, PhysicalPosition<f64>)> {
+    motion_event
+        .pointers()
+        .map(|pointer| (pointer.pointer_id(), pointer_position(&pointer)))
+        .collect()
+}
+
+/// The fingers still on the glass after `motion_event`: an `Up` event carries the finger that is
+/// leaving as well, and that one is gone.
+fn remaining_touch_points(
+    motion_event: &android_activity::input::MotionEvent<'_>,
+) -> Vec<(i32, PhysicalPosition<f64>)> {
+    let mut points = collect_touch_points(motion_event);
+    if matches!(
+        motion_event.action(),
+        MotionAction::Up | MotionAction::PointerUp
+    ) {
+        let leaving = motion_event
+            .pointer_at_index(motion_event.pointer_index())
+            .pointer_id();
+        points.retain(|(id, _)| *id != leaving);
+    }
+    points
 }
 
 fn android_mouse_button(button: android_activity::input::Button) -> event::MouseButton {
@@ -88,12 +144,12 @@ impl<T> PeekableReceiver<T> {
             Ok(v) => {
                 self.first = Some(v);
                 true
-            },
+            }
             Err(mpsc::TryRecvError::Empty) => false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 warn!("Channel was disconnected when checking incoming");
                 false
-            },
+            }
         }
     }
 
@@ -111,7 +167,9 @@ struct SharedFlagSetter {
 }
 impl SharedFlagSetter {
     pub fn set(&self) -> bool {
-        self.flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        self.flag
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
@@ -125,11 +183,15 @@ struct SharedFlag {
 // was queued and be able to read and clear the state atomically)
 impl SharedFlag {
     pub fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)) }
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn setter(&self) -> SharedFlagSetter {
-        SharedFlagSetter { flag: self.flag.clone() }
+        SharedFlagSetter {
+            flag: self.flag.clone(),
+        }
     }
 
     pub fn get_and_reset(&self) -> bool {
@@ -145,7 +207,10 @@ pub struct RedrawRequester {
 
 impl RedrawRequester {
     fn new(flag: &SharedFlag, waker: AndroidAppWaker) -> Self {
-        RedrawRequester { flag: flag.setter(), waker }
+        RedrawRequester {
+            flag: flag.setter(),
+            waker,
+        }
     }
 
     pub fn request_redraw(&self) {
@@ -172,6 +237,59 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    /// Active touch points (finger id -> position in physical pixels), for the two-finger
+    /// gesture recognition below. Empty when no fingers are down.
+    touch_points: Vec<(i32, PhysicalPosition<f64>)>,
+    /// What the current multi-finger gesture has been recognised as.
+    gesture: Gesture,
+    /// The fingers' spread and midpoint where the gesture started: the deadzone is measured
+    /// against them.
+    gesture_origin: Option<(f64, PhysicalPosition<f64>)>,
+    /// The spread at the last reported pinch step, so each zoom is relative to the last one.
+    gesture_spread: Option<f64>,
+    /// The finger that was already on the glass when a second one joined it: the one whose
+    /// touch has to be cancelled when the gesture takes over.
+    gesture_pointer: Option<(i32, PhysicalPosition<f64>)>,
+    /// Where a hardware touchpad's gesture was when its last event came: the gesture is
+    /// reported as a pointer that walks across the screen, and the distance it walked is
+    /// the scroll.
+    pad_position: Option<PhysicalPosition<f64>>,
+    /// How far apart a hardware touchpad's pinch fingers were when its last event came:
+    /// the pinch is reported as two pointers that move apart or together.
+    pad_spread: Option<f64>,
+}
+
+/// What a multi-finger gesture has been recognised as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Gesture {
+    /// Not decided yet: the fingers are still inside the deadzone.
+    Undecided,
+    /// A two-finger pan: reported as scrolling.
+    Pan,
+    /// A pinch: reported as a zoom.
+    Pinch,
+}
+
+/// What a hardware touchpad is doing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PadGesture {
+    /// Not a gesture: the events are ordinary pointer events.
+    None,
+    /// A two-finger slide: reported as scrolling.
+    Scroll,
+    /// A two-finger pinch: reported as a zoom.
+    Pinch,
+}
+
+/// What the backend made of a multi-finger gesture.
+enum GestureStep {
+    /// Not a two-finger gesture, or still inside the deadzone: the fingers are reported as
+    /// touches.
+    None,
+    /// A pan: the two fingers' midpoint moved by this much (physical pixels).
+    Pan(PhysicalPosition<f64>),
+    /// A pinch: the fingers spread (or closed) by this factor since the last step.
+    Pinch(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,7 +300,10 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
 
 impl Default for PlatformSpecificEventLoopAttributes {
     fn default() -> Self {
-        Self { android_app: Default::default(), ignore_volume_keys: true }
+        Self {
+            android_app: Default::default(),
+            ignore_volume_keys: true,
+        }
     }
 }
 
@@ -226,6 +347,13 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            touch_points: Vec::new(),
+            gesture: Gesture::Undecided,
+            gesture_origin: None,
+            gesture_spread: None,
+            gesture_pointer: None,
+            pad_position: None,
+            pad_spread: None,
         })
     }
 
@@ -247,15 +375,15 @@ impl<T: 'static> EventLoop<T> {
             match event {
                 MainEvent::InitWindow { .. } => {
                     callback(event::Event::Resumed, self.window_target());
-                },
+                }
                 MainEvent::TerminateWindow { .. } => {
                     callback(event::Event::Suspended, self.window_target());
-                },
+                }
                 MainEvent::WindowResized { .. } => resized = true,
                 MainEvent::RedrawNeeded { .. } => pending_redraw = true,
                 MainEvent::ContentRectChanged { .. } => {
                     warn!("TODO: find a way to notify application of content rect change");
-                },
+                }
                 MainEvent::GainedFocus => {
                     HAS_FOCUS.store(true, Ordering::Relaxed);
                     callback(
@@ -265,7 +393,7 @@ impl<T: 'static> EventLoop<T> {
                         },
                         self.window_target(),
                     );
-                },
+                }
                 MainEvent::LostFocus => {
                     HAS_FOCUS.store(false, Ordering::Relaxed);
                     callback(
@@ -275,7 +403,7 @@ impl<T: 'static> EventLoop<T> {
                         },
                         self.window_target(),
                     );
-                },
+                }
                 MainEvent::ConfigChanged { .. } => {
                     let monitor = MonitorHandle::new(self.android_app.clone());
                     let old_scale_factor = monitor.scale_factor();
@@ -295,43 +423,43 @@ impl<T: 'static> EventLoop<T> {
                         };
                         callback(event, self.window_target());
                     }
-                },
+                }
                 MainEvent::LowMemory => {
                     callback(event::Event::MemoryWarning, self.window_target());
-                },
+                }
                 MainEvent::Start => {
                     // XXX: how to forward this state to applications?
                     warn!("TODO: forward onStart notification to application");
-                },
+                }
                 MainEvent::Resume { .. } => {
                     debug!("App Resumed - is running");
                     self.running = true;
-                },
+                }
                 MainEvent::SaveState { .. } => {
                     // XXX: how to forward this state to applications?
                     // XXX: also how do we expose state restoration to apps?
                     warn!("TODO: forward saveState notification to application");
-                },
+                }
                 MainEvent::Pause => {
                     debug!("App Paused - stopped running");
                     self.running = false;
-                },
+                }
                 MainEvent::Stop => {
                     // XXX: how to forward this state to applications?
                     warn!("TODO: forward onStop notification to application");
-                },
+                }
                 MainEvent::Destroy => {
                     // XXX: maybe exit mainloop to drop things before being
                     // killed by the OS?
                     warn!("TODO: forward onDestroy notification to application");
-                },
+                }
                 MainEvent::InsetsChanged { .. } => {
                     // XXX: how to forward this state to applications?
                     warn!("TODO: handle Android InsetsChanged notification");
-                },
+                }
                 unknown => {
                     trace!("Unknown MainEvent {unknown:?} (ignored)");
-                },
+                }
             }
         } else {
             trace!("No main event to handle");
@@ -353,7 +481,7 @@ impl<T: 'static> EventLoop<T> {
             },
             Err(err) => {
                 tracing::warn!("Failed to get input events iterator: {err:?}");
-            },
+            }
         }
 
         // Empty the user event buffer
@@ -396,6 +524,186 @@ impl<T: 'static> EventLoop<T> {
         self.pending_redraw = pending_redraw;
     }
 
+    /// Recognise a multi-finger gesture and report it the way a trackpad does.
+    ///
+    /// A phone or tablet has no wheel, so a two-finger drag is the platform's scroll gesture (as
+    /// on a trackpad). Upstream winit forwards each finger as a separate `Touch` event and
+    /// nothing turns the gesture into scrolling, so a two-finger drag did nothing.
+    ///
+    /// Chromium makes the same decision for a trackpad, and the WebView build of WordCraft
+    /// inherits it: a two-finger slide is a scroll (a `DOM_DELTA_PIXEL` wheel event, applied 1:1)
+    /// and a two-finger pinch is a zoom (a ctrl-wheel event, which `eframe` turns into
+    /// `egui::Event::Zoom`). Android hands us the raw finger positions instead, so the backend
+    /// has to make that call — and it has to make it *once*: a gesture that flips from scroll to
+    /// zoom halfway through leaves the document half zoomed, and a gesture egui reads as a pinch
+    /// (it computes a zoom from the distance between two fingers) turns every scroll into a slow
+    /// zoom.
+    ///
+    /// So the gesture is decided once, inside a deadzone, and then sticks until the fingers lift:
+    /// a pan that moves the fingers' midpoint further than [`PAN_DEADZONE_PX`] scrolls, a gesture
+    /// that changes their spread further than [`PINCH_DEADZONE_PX`] (and much further than it
+    /// moves the midpoint) zooms, and anything in between does nothing at all.
+    fn recognise_touch_gesture(
+        &mut self,
+        motion_event: &android_activity::input::MotionEvent<'_>,
+    ) -> GestureStep {
+        match motion_event.action() {
+            MotionAction::Down
+            | MotionAction::PointerDown
+            | MotionAction::Up
+            | MotionAction::PointerUp
+            | MotionAction::Cancel => {
+                // A finger went down or up: the gesture starts over. Rebuild the set of fingers
+                // from the event (a `Down` carries every active pointer; an `Up` carries the
+                // finger that is leaving as well, and that one is gone).
+                let previous = std::mem::replace(
+                    &mut self.touch_points,
+                    remaining_touch_points(motion_event),
+                );
+                self.gesture = Gesture::Undecided;
+                self.gesture_origin = None;
+                self.gesture_spread = None;
+                // The finger that was already on the glass when this one joined: the one whose
+                // touch has to be cancelled when the gesture takes over.
+                self.gesture_pointer = previous.first().copied();
+                GestureStep::None
+            }
+            MotionAction::Move => {
+                // The number of fingers this event carries, and the number we were tracking. A
+                // change in either (a third finger landing, one of two lifting) ends the gesture.
+                if self.touch_points.len() != 2 || motion_event.pointer_count() != 2 {
+                    // Keep the tracked positions current even for 1 or 3+ fingers (we just don't
+                    // scroll for those), so a later two-finger move has a correct previous point.
+                    self.sync_touch_points(motion_event);
+                    self.gesture = Gesture::Undecided;
+                    self.gesture_origin = None;
+                    self.gesture_spread = None;
+                    return GestureStep::None;
+                }
+                let Some(midpoint) = self.touch_midpoint() else {
+                    return GestureStep::None;
+                };
+                let Some(spread) = self.touch_spread() else {
+                    return GestureStep::None;
+                };
+                // Update the tracked positions first, so the next event measures against these.
+                self.sync_touch_points(motion_event);
+                let Some(new_midpoint) = self.touch_midpoint() else {
+                    return GestureStep::None;
+                };
+                let Some(new_spread) = self.touch_spread() else {
+                    return GestureStep::None;
+                };
+
+                // The deadzone is measured from where the gesture started.
+                let (origin_spread, origin_midpoint) =
+                    *self.gesture_origin.get_or_insert((spread, midpoint));
+                let spread_change = (new_spread - origin_spread).abs();
+                let moved = ((new_midpoint.x - origin_midpoint.x).powi(2)
+                    + (new_midpoint.y - origin_midpoint.y).powi(2))
+                .sqrt();
+
+                match self.gesture {
+                    Gesture::Undecided => {
+                        // A pinch changes the spread much more than the midpoint moves; that is a
+                        // zoom, not a scroll. Until one of the two is clearly bigger, the
+                        // gesture stays undecided and nothing is reported: that is the
+                        // deadzone between scrolling and zooming.
+                        if spread_change > PINCH_DEADZONE_PX
+                            && spread_change > PINCH_SPREAD_RATIO * moved
+                        {
+                            self.gesture = Gesture::Pinch;
+                        } else if moved > PAN_DEADZONE_PX {
+                            self.gesture = Gesture::Pan;
+                        } else {
+                            return GestureStep::None;
+                        }
+                    }
+                    Gesture::Pan => {
+                        // A pan that turns into a clear pinch hands over to the zoom, but only
+                        // once the spread has changed twice as much as the deadzone: a gesture
+                        // that has already started scrolling does not flip on a twitch.
+                        if spread_change > 2.0 * PINCH_DEADZONE_PX {
+                            self.gesture = Gesture::Pinch;
+                        }
+                    }
+                    Gesture::Pinch => {}
+                }
+
+                match self.gesture {
+                    Gesture::Pinch => {
+                        // The zoom is relative to the last step, so a pinch that starts at the
+                        // deadzone's edge does not jump: the spread change that got us here is
+                        // the deadzone's, and the zoom starts from where the fingers are now.
+                        let last = self.gesture_spread.replace(new_spread).unwrap_or(new_spread);
+                        let factor = if last > 0.0 { new_spread / last } else { 1.0 };
+                        GestureStep::Pinch(factor)
+                    }
+                    Gesture::Pan => {
+                        // The fingers' midpoint moved: that is the scroll. The delta is signed
+                        // the way a wheel event is (positive = the content moves down/right) and
+                        // the content follows the fingers, so it is their own motion.
+                        GestureStep::Pan(PhysicalPosition {
+                            x: (new_midpoint.x - midpoint.x) * PAN_SPEED,
+                            y: (new_midpoint.y - midpoint.y) * PAN_SPEED,
+                        })
+                    }
+                    Gesture::Undecided => GestureStep::None,
+                }
+            }
+            _ => GestureStep::None,
+        }
+    }
+
+    /// Update the tracked positions of the fingers in `motion_event`, keeping the set in step with
+    /// the glass (adding fingers that appeared, dropping the ones that left).
+    fn sync_touch_points(&mut self, motion_event: &android_activity::input::MotionEvent<'_>) {
+        let seen: Vec<(i32, PhysicalPosition<f64>)> = motion_event
+            .pointers()
+            .map(|pointer| {
+                (
+                    pointer.pointer_id(),
+                    PhysicalPosition {
+                        x: pointer.x() as f64,
+                        y: pointer.y() as f64,
+                    },
+                )
+            })
+            .collect();
+        if seen.len() == self.touch_points.len() {
+            // Same fingers: just refresh their positions.
+            self.touch_points = seen;
+            return;
+        }
+        // The finger count changed mid-gesture (e.g. a third finger landed): keep the ones we know
+        // and adopt the new ones, so the midpoint stays meaningful for the fingers we do track.
+        for (id, position) in seen {
+            match self.touch_points.iter_mut().find(|(known, _)| *known == id) {
+                Some((_, known_position)) => *known_position = position,
+                None => self.touch_points.push((id, position)),
+            }
+        }
+    }
+
+    /// The midpoint of exactly two tracked fingers, if both are known.
+    fn touch_midpoint(&self) -> Option<PhysicalPosition<f64>> {
+        let [(_, a), (_, b)] = self.touch_points.as_slice() else {
+            return None;
+        };
+        Some(PhysicalPosition {
+            x: (a.x + b.x) / 2.0,
+            y: (a.y + b.y) / 2.0,
+        })
+    }
+
+    /// The distance between exactly two tracked fingers, if both are known.
+    fn touch_spread(&self) -> Option<f64> {
+        let [(_, a), (_, b)] = self.touch_points.as_slice() else {
+            return None;
+        };
+        Some(((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt())
+    }
+
     fn handle_input_event<F>(
         &mut self,
         android_app: &AndroidApp,
@@ -418,15 +726,131 @@ impl<T: 'static> EventLoop<T> {
                 // moved. Events from pointer-class devices (mouse/trackball/touchpad by
                 // source, or anything whose tool is a mouse) are translated to real winit
                 // pointer events here; fingers and styluses keep the upstream touch path.
+                //
+                // What the device is comes from its source *and* from the tool it was used
+                // with: Android describes a device by a bitmask of source flags, and a
+                // touchpad's is a combination of two of them (`SOURCE_MOUSE |
+                // SOURCE_TOUCHPAD`), so matching the whole value against one constant
+                // matches nothing at all — and a device that matches nothing is taken for a
+                // finger on the glass, which is how a trackpad's scroll ended up dragging
+                // the document around instead of scrolling it.
                 let tool_type = if motion_event.pointer_count() > 0 {
                     motion_event.pointer_at_index(0).tool_type()
                 } else {
                     ToolType::Unknown
                 };
-                let pointer_class = matches!(
-                    motion_event.source(),
-                    Source::Mouse | Source::MouseRelative | Source::Touchpad | Source::Trackball
-                ) || tool_type == ToolType::Mouse;
+                let device = device_kind::classify(
+                    u32::from(motion_event.source()),
+                    match tool_type {
+                        ToolType::Unknown => device_kind::Tool::Unknown,
+                        ToolType::Finger => device_kind::Tool::Finger,
+                        ToolType::Stylus => device_kind::Tool::Stylus,
+                        ToolType::Mouse => device_kind::Tool::Mouse,
+                        _ => device_kind::Tool::Other,
+                    },
+                );
+                let pointer_class = device.pointer;
+                // A touchpad is a pointing device whose tool is a finger: its scroll is
+                // smooth and continuous, where a mouse's is a number of notches.
+                let touchpad = device.touchpad;
+
+                // A hardware touchpad's gesture: a two-finger slide or a pinch. Android
+                // reports it as a motion event with a classification and a pointer that
+                // walks across the screen as the gesture goes on — the pointer is not a
+                // finger on the glass (it starts at the cursor and is moved by the
+                // gesture), so the event is a scroll or a zoom and never a press, a drag
+                // or a cursor move.
+                let pad_gesture = match motion_event.classification() {
+                    Classification::TwoFingerSwipe | Classification::MultiFingerSwipe => {
+                        PadGesture::Scroll
+                    }
+                    Classification::Pinch => PadGesture::Pinch,
+                    _ => PadGesture::None,
+                };
+                if pad_gesture != PadGesture::None {
+                    let position = motion_event
+                        .pointers()
+                        .next()
+                        .map(|pointer| pointer_position(&pointer));
+                    match motion_event.action() {
+                        MotionAction::Down | MotionAction::PointerDown => {
+                            // The gesture starts here: the pointer is where the cursor is.
+                            self.pad_position = position;
+                            self.pad_spread = None;
+                        }
+                        MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
+                            self.pad_position = None;
+                            self.pad_spread = None;
+                        }
+                        MotionAction::Move => match pad_gesture {
+                            PadGesture::Scroll => {
+                                // The pointer walks with the scroll, so the distance it
+                                // walked is the scroll — the same pixels, in the same
+                                // direction, as a two-finger drag on the glass.
+                                if let Some(current) = position {
+                                    let delta = self.pad_position.map_or(
+                                        PhysicalPosition { x: 0.0, y: 0.0 },
+                                        |previous| PhysicalPosition {
+                                            x: current.x - previous.x,
+                                            y: current.y - previous.y,
+                                        },
+                                    );
+                                    self.pad_position = Some(current);
+                                    if delta.x != 0.0 || delta.y != 0.0 {
+                                        trace!("Trackpad scroll {device_id:?} {delta:?}");
+                                        callback(
+                                            event::Event::WindowEvent {
+                                                window_id,
+                                                event: event::WindowEvent::MouseWheel {
+                                                    device_id,
+                                                    delta: event::MouseScrollDelta::PixelDelta(
+                                                        delta,
+                                                    ),
+                                                    phase: event::TouchPhase::Moved,
+                                                },
+                                            },
+                                            self.window_target(),
+                                        );
+                                    }
+                                }
+                            }
+                            PadGesture::Pinch => {
+                                // The two pointers move apart or together: how much they
+                                // changed is the zoom, relative to the last step.
+                                let spread = pointer_spread(&motion_event);
+                                if let Some(current) = spread {
+                                    let factor = self.pad_spread.map_or(1.0, |previous| {
+                                        if previous > 0.0 {
+                                            current / previous
+                                        } else {
+                                            1.0
+                                        }
+                                    });
+                                    self.pad_spread = Some(current);
+                                    if factor != 1.0 {
+                                        trace!("Trackpad pinch {device_id:?} {factor:?}");
+                                        callback(
+                                            event::Event::WindowEvent {
+                                                window_id,
+                                                event: event::WindowEvent::PinchGesture {
+                                                    device_id,
+                                                    // The log of the factor: `egui` turns it
+                                                    // back into the factor itself.
+                                                    delta: factor.ln(),
+                                                    phase: event::TouchPhase::Moved,
+                                                },
+                                            },
+                                            self.window_target(),
+                                        );
+                                    }
+                                }
+                            }
+                            PadGesture::None => {}
+                        },
+                        _ => {}
+                    }
+                    return input_status;
+                }
 
                 match motion_event.action() {
                     // Hover: the cursor moves without any button held. Ordered before the
@@ -454,7 +878,10 @@ impl<T: 'static> EventLoop<T> {
                             callback(
                                 event::Event::WindowEvent {
                                     window_id,
-                                    event: event::WindowEvent::CursorMoved { device_id, position },
+                                    event: event::WindowEvent::CursorMoved {
+                                        device_id,
+                                        position,
+                                    },
                                 },
                                 self.window_target(),
                             );
@@ -468,10 +895,27 @@ impl<T: 'static> EventLoop<T> {
                                 );
                             }
                         }
-                    },
-                    // Wheel/trackpad scrolling: the scroll axes hold ±1 per wheel notch (so
-                    // they become line deltas) and larger smooth amounts (trackpad) become
-                    // pixel deltas at egui's 40-points-per-line speed.
+                    }
+                    // Wheel scrolling.
+                    //
+                    // Chromium draws the same line in the WebView build: a mouse wheel reports
+                    // notches (`DOM_DELTA_LINE`) and a trackpad reports smooth, continuous
+                    // amounts in pixels (`DOM_DELTA_PIXEL`). Android normalises a mouse's
+                    // wheel to ±1 per notch on the scroll axes; a touchpad reports the same
+                    // axes, but continuously — and the two are told apart by the *device*, not
+                    // by the size of the number: a touchpad's source is `SOURCE_TOUCHPAD`, or
+                    // a mouse source whose tool is a finger.
+                    //
+                    // A hardware touchpad's own two-finger gesture does not come through here
+                    // at all: Android reports it as a classified motion event (a pointer that
+                    // walks across the screen), which is handled above.
+                    //
+                    // Deciding by the size of the amount instead (a threshold above which the
+                    // amount was treated as pixels) made the scroll jump by a different factor
+                    // as soon as a touchpad's amount grew past it, and sent a mouse's notches
+                    // down the smooth path, where they fed the momentum and the page coasted
+                    // on after the wheel had stopped — a scroll that felt like it happened
+                    // twice.
                     MotionAction::Scroll if pointer_class => {
                         let (vertical, horizontal) = motion_event
                             .pointers()
@@ -484,15 +928,13 @@ impl<T: 'static> EventLoop<T> {
                             })
                             .unwrap_or((0.0, 0.0));
                         if vertical != 0.0 || horizontal != 0.0 {
-                            let delta = if vertical.abs() <= MAX_LINE_SCROLL
-                                && horizontal.abs() <= MAX_LINE_SCROLL
-                            {
-                                event::MouseScrollDelta::LineDelta(horizontal, vertical)
-                            } else {
+                            let delta = if touchpad {
                                 event::MouseScrollDelta::PixelDelta(PhysicalPosition {
-                                    x: f64::from(horizontal) * f64::from(POINTS_PER_LINE),
-                                    y: f64::from(vertical) * f64::from(POINTS_PER_LINE),
+                                    x: f64::from(horizontal) * POINTS_PER_AXIS,
+                                    y: f64::from(vertical) * POINTS_PER_AXIS,
                                 })
+                            } else {
+                                event::MouseScrollDelta::LineDelta(horizontal, vertical)
                             };
                             trace!("Scroll {device_id:?} {delta:?}");
                             callback(
@@ -507,13 +949,11 @@ impl<T: 'static> EventLoop<T> {
                                 self.window_target(),
                             );
                         }
-                    },
+                    }
                     // Secondary/middle/back/forward buttons (the primary one arrives as
                     // plain Down/Up). The cursor position is reported first so egui has a
                     // valid pointer position to interpret the button change against.
-                    MotionAction::ButtonPress | MotionAction::ButtonRelease
-                        if pointer_class =>
-                    {
+                    MotionAction::ButtonPress | MotionAction::ButtonRelease if pointer_class => {
                         let state = if motion_event.action() == MotionAction::ButtonPress {
                             event::ElementState::Pressed
                         } else {
@@ -527,7 +967,10 @@ impl<T: 'static> EventLoop<T> {
                             callback(
                                 event::Event::WindowEvent {
                                     window_id,
-                                    event: event::WindowEvent::CursorMoved { device_id, position },
+                                    event: event::WindowEvent::CursorMoved {
+                                        device_id,
+                                        position,
+                                    },
                                 },
                                 self.window_target(),
                             );
@@ -537,11 +980,15 @@ impl<T: 'static> EventLoop<T> {
                         callback(
                             event::Event::WindowEvent {
                                 window_id,
-                                event: event::WindowEvent::MouseInput { device_id, state, button },
+                                event: event::WindowEvent::MouseInput {
+                                    device_id,
+                                    state,
+                                    button,
+                                },
                             },
                             self.window_target(),
                         );
-                    },
+                    }
                     // Mouse-class down/up/move/cancel: pointer events, never `Touch` (a
                     // single `Event::Touch` would make egui treat every later mouse move as
                     // a finger drag on a touch screen).
@@ -563,33 +1010,35 @@ impl<T: 'static> EventLoop<T> {
                         let state = match motion_event.action() {
                             MotionAction::Down | MotionAction::PointerDown => {
                                 Some(event::ElementState::Pressed)
-                            },
+                            }
                             MotionAction::Up | MotionAction::PointerUp => {
                                 Some(event::ElementState::Released)
-                            },
+                            }
                             // A cancelled gesture must not leave a button logically held.
                             MotionAction::Cancel => Some(event::ElementState::Released),
                             _ => None,
                         };
-                        let pointers: Box<dyn Iterator<Item = android_activity::input::Pointer<'_>>> =
-                            if single_pointer {
-                                Box::new(std::iter::once(
-                                    motion_event.pointer_at_index(motion_event.pointer_index()),
-                                ))
-                            } else {
-                                Box::new(motion_event.pointers())
-                            };
+                        let pointers: Box<
+                            dyn Iterator<Item = android_activity::input::Pointer<'_>>,
+                        > = if single_pointer {
+                            Box::new(std::iter::once(
+                                motion_event.pointer_at_index(motion_event.pointer_index()),
+                            ))
+                        } else {
+                            Box::new(motion_event.pointers())
+                        };
 
                         let mut button_sent = false;
                         for pointer in pointers {
                             let position = pointer_position(&pointer);
-                            trace!(
-                                "Pointer {device_id:?} loc={position:?}, pointer={pointer:?}"
-                            );
+                            trace!("Pointer {device_id:?} loc={position:?}, pointer={pointer:?}");
                             callback(
                                 event::Event::WindowEvent {
                                     window_id,
-                                    event: event::WindowEvent::CursorMoved { device_id, position },
+                                    event: event::WindowEvent::CursorMoved {
+                                        device_id,
+                                        position,
+                                    },
                                 },
                                 self.window_target(),
                             );
@@ -619,22 +1068,90 @@ impl<T: 'static> EventLoop<T> {
                                 }
                             }
                         }
-                    },
+                    }
                     // Fingers and styluses (and any device we don't classify as a pointer):
-                    // the upstream touch path, unchanged.
+                    // the upstream touch path, plus the two-finger gesture recognition
+                    // (`recognise_touch_gesture`). A two-finger pan emits `MouseWheel` and a
+                    // pinch emits `PinchGesture`, the same two things a trackpad's wheel and
+                    // pinch turn into in a browser; every other gesture falls through to the
+                    // touch path unchanged, so single-finger taps and drags keep working
+                    // exactly as before.
                     MotionAction::Down
                     | MotionAction::PointerDown
                     | MotionAction::Up
                     | MotionAction::PointerUp
                     | MotionAction::Move
                     | MotionAction::Cancel => {
+                        match self.recognise_touch_gesture(motion_event) {
+                            GestureStep::Pan(delta) => {
+                                trace!("Two-finger scroll {device_id:?} {delta:?}");
+                                callback(
+                                    event::Event::WindowEvent {
+                                        window_id,
+                                        event: event::WindowEvent::MouseWheel {
+                                            device_id,
+                                            delta: event::MouseScrollDelta::PixelDelta(delta),
+                                            phase: event::TouchPhase::Moved,
+                                        },
+                                    },
+                                    self.window_target(),
+                                );
+                                return input_status;
+                            }
+                            GestureStep::Pinch(factor) => {
+                                trace!("Two-finger pinch {device_id:?} {factor:?}");
+                                callback(
+                                    event::Event::WindowEvent {
+                                        window_id,
+                                        event: event::WindowEvent::PinchGesture {
+                                            device_id,
+                                            // The log of the factor: `egui` turns it back into
+                                            // the factor itself.
+                                            delta: factor.ln(),
+                                            phase: event::TouchPhase::Moved,
+                                        },
+                                    },
+                                    self.window_target(),
+                                );
+                                return input_status;
+                            }
+                            GestureStep::None => {}
+                        }
+                        // Two or more fingers on the glass: the gesture belongs to the backend
+                        // (a scroll or a zoom), so the fingers are not reported as touches —
+                        // egui would read them as a drag, or as a pinch of its own.
+                        if self.touch_points.len() >= 2 {
+                            // A second finger just landed: the first finger's touch, which egui
+                            // took for a pointer press, is cancelled, so the gesture does not
+                            // start a text selection. The finger is still on the glass, so the
+                            // pointer keeps its place: the canvas only takes the scroll while
+                            // the pointer is over it.
+                            if motion_event.action() == MotionAction::PointerDown {
+                                if let Some((id, location)) = self.gesture_pointer.take() {
+                                    callback(
+                                        event::Event::WindowEvent {
+                                            window_id,
+                                            event: event::WindowEvent::Touch(event::Touch {
+                                                device_id,
+                                                phase: event::TouchPhase::Cancelled,
+                                                location,
+                                                id: id as u64,
+                                                force: None,
+                                            }),
+                                        },
+                                        self.window_target(),
+                                    );
+                                }
+                            }
+                            return input_status;
+                        }
                         let phase = match motion_event.action() {
                             MotionAction::Down | MotionAction::PointerDown => {
                                 Some(event::TouchPhase::Started)
-                            },
+                            }
                             MotionAction::Up | MotionAction::PointerUp => {
                                 Some(event::TouchPhase::Ended)
-                            },
+                            }
                             MotionAction::Move => Some(event::TouchPhase::Moved),
                             MotionAction::Cancel => Some(event::TouchPhase::Cancelled),
                             _ => None,
@@ -647,15 +1164,17 @@ impl<T: 'static> EventLoop<T> {
                                     Box::new(std::iter::once(
                                         motion_event.pointer_at_index(motion_event.pointer_index()),
                                     ))
-                                },
+                                }
                                 event::TouchPhase::Moved | event::TouchPhase::Cancelled => {
                                     Box::new(motion_event.pointers())
-                                },
+                                }
                             };
 
                             for pointer in pointers {
-                                let location =
-                                    PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
+                                let location = PhysicalPosition {
+                                    x: pointer.x() as _,
+                                    y: pointer.y() as _,
+                                };
                                 trace!(
                                     "Input event {device_id:?}, {phase:?}, loc={location:?}, \
                                      pointer={pointer:?}"
@@ -673,12 +1192,12 @@ impl<T: 'static> EventLoop<T> {
                                 callback(event, self.window_target());
                             }
                         }
-                    },
+                    }
                     // Anything else (hover/scroll/buttons on touch-only devices, actions
                     // newer than this winit, …): nothing to translate.
-                    _ => {},
+                    _ => {}
                 }
-            },
+            }
             InputEvent::KeyEvent(key) => {
                 match key.key_code() {
                     // Flag keys related to volume as unhandled. While winit does not have a way for
@@ -689,7 +1208,7 @@ impl<T: 'static> EventLoop<T> {
                         if self.ignore_volume_keys =>
                     {
                         input_status = InputStatus::Unhandled
-                    },
+                    }
                     keycode => {
                         let state = match key.action() {
                             KeyAction::Down => event::ElementState::Pressed,
@@ -727,12 +1246,12 @@ impl<T: 'static> EventLoop<T> {
                             },
                         };
                         callback(event, self.window_target());
-                    },
+                    }
                 }
-            },
+            }
             _ => {
                 warn!("Unknown android_activity input event {event:?}")
-            },
+            }
         }
 
         input_status
@@ -753,13 +1272,13 @@ impl<T: 'static> EventLoop<T> {
             match self.pump_events(None, &mut event_handler) {
                 PumpStatus::Exit(0) => {
                     break Ok(());
-                },
+                }
                 PumpStatus::Exit(code) => {
                     break Err(EventLoopError::ExitFailure(code));
-                },
+                }
                 _ => {
                     continue;
-                },
+                }
             }
         }
     }
@@ -815,7 +1334,7 @@ impl<T: 'static> EventLoop<T> {
                     ControlFlow::Poll => Some(Duration::ZERO),
                     ControlFlow::WaitUntil(wait_deadline) => {
                         Some(wait_deadline.saturating_duration_since(start))
-                    },
+                    }
                 };
 
                 min_timeout(control_flow_timeout, timeout)
@@ -841,26 +1360,35 @@ impl<T: 'static> EventLoop<T> {
                     {
                         return;
                     }
-                },
-                android_activity::PollEvent::Timeout => {},
+                }
+                android_activity::PollEvent::Timeout => {}
                 android_activity::PollEvent::Main(event) => {
                     main_event = Some(event);
-                },
+                }
                 unknown_event => {
                     warn!("Unknown poll event {unknown_event:?} (ignored)");
-                },
+                }
             }
 
             self.cause = match self.control_flow() {
                 ControlFlow::Poll => StartCause::Poll,
-                ControlFlow::Wait => StartCause::WaitCancelled { start, requested_resume: None },
+                ControlFlow::Wait => StartCause::WaitCancelled {
+                    start,
+                    requested_resume: None,
+                },
                 ControlFlow::WaitUntil(deadline) => {
                     if Instant::now() < deadline {
-                        StartCause::WaitCancelled { start, requested_resume: Some(deadline) }
+                        StartCause::WaitCancelled {
+                            start,
+                            requested_resume: Some(deadline),
+                        }
                     } else {
-                        StartCause::ResumeTimeReached { start, requested_resume: deadline }
+                        StartCause::ResumeTimeReached {
+                            start,
+                            requested_resume: deadline,
+                        }
                     }
-                },
+                }
             };
 
             self.single_iteration(main_event, &mut callback);
@@ -903,7 +1431,9 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 
 impl<T> EventLoopProxy<T> {
     pub fn send_event(&self, event: T) -> Result<(), event_loop::EventLoopClosed<T>> {
-        self.user_events_sender.send(event).map_err(|err| event_loop::EventLoopClosed(err.0))?;
+        self.user_events_sender
+            .send(event)
+            .map_err(|err| event_loop::EventLoopClosed(err.0))?;
         self.waker.wake();
         Ok(())
     }
@@ -923,7 +1453,9 @@ impl ActiveEventLoop {
 
     pub fn create_custom_cursor(&self, source: CustomCursorSource) -> CustomCursor {
         let _ = source.inner;
-        CustomCursor { inner: PlatformCustomCursor }
+        CustomCursor {
+            inner: PlatformCustomCursor,
+        }
     }
 
     pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
@@ -951,7 +1483,9 @@ impl ActiveEventLoop {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::RawDisplayHandle::Android(rwh_06::AndroidDisplayHandle::new()))
+        Ok(rwh_06::RawDisplayHandle::Android(
+            rwh_06::AndroidDisplayHandle::new(),
+        ))
     }
 
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
@@ -1043,7 +1577,10 @@ impl Window {
     ) -> Result<Self, error::OsError> {
         // FIXME this ignores requested window attributes
 
-        Ok(Self { app: el.app.clone(), redraw_requester: el.redraw_requester.clone() })
+        Ok(Self {
+            app: el.app.clone(),
+            redraw_requester: el.redraw_requester.clone(),
+        })
     }
 
     pub(crate) fn maybe_queue_on_main(&self, f: impl FnOnce(&Self) + Send + 'static) {
@@ -1189,31 +1726,41 @@ impl Window {
     pub fn set_cursor(&self, _: Cursor) {}
 
     pub fn set_cursor_position(&self, _: Position) -> Result<(), error::ExternalError> {
-        Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
+        Err(error::ExternalError::NotSupported(
+            error::NotSupportedError::new(),
+        ))
     }
 
     pub fn set_cursor_grab(&self, _: CursorGrabMode) -> Result<(), error::ExternalError> {
-        Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
+        Err(error::ExternalError::NotSupported(
+            error::NotSupportedError::new(),
+        ))
     }
 
     pub fn set_cursor_visible(&self, _: bool) {}
 
     pub fn drag_window(&self) -> Result<(), error::ExternalError> {
-        Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
+        Err(error::ExternalError::NotSupported(
+            error::NotSupportedError::new(),
+        ))
     }
 
     pub fn drag_resize_window(
         &self,
         _direction: ResizeDirection,
     ) -> Result<(), error::ExternalError> {
-        Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
+        Err(error::ExternalError::NotSupported(
+            error::NotSupportedError::new(),
+        ))
     }
 
     #[inline]
     pub fn show_window_menu(&self, _position: Position) {}
 
     pub fn set_cursor_hittest(&self, _hittest: bool) -> Result<(), error::ExternalError> {
-        Err(error::ExternalError::NotSupported(error::NotSupportedError::new()))
+        Err(error::ExternalError::NotSupported(
+            error::NotSupportedError::new(),
+        ))
     }
 
     #[cfg(feature = "rwh_04")]
@@ -1273,7 +1820,9 @@ impl Window {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::RawDisplayHandle::Android(rwh_06::AndroidDisplayHandle::new()))
+        Ok(rwh_06::RawDisplayHandle::Android(
+            rwh_06::AndroidDisplayHandle::new(),
+        ))
     }
 
     pub fn config(&self) -> ConfigurationRef {
@@ -1350,7 +1899,11 @@ impl MonitorHandle {
     }
 
     pub fn scale_factor(&self) -> f64 {
-        self.app.config().density().map(|dpi| dpi as f64 / 160.0).unwrap_or(1.0)
+        self.app
+            .config()
+            .density()
+            .map(|dpi| dpi as f64 / 160.0)
+            .unwrap_or(1.0)
     }
 
     pub fn refresh_rate_millihertz(&self) -> Option<u32> {

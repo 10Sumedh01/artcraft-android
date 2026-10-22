@@ -237,6 +237,37 @@ mod saf {
                 .map_err(|e| e.to_string())
         }
 
+        /// How many files the system (or a drop) handed us that the shell has not opened yet.
+        /// Asked without taking anything off the queue, so the frame that opens the file still
+        /// finds it there. The shell's watcher thread uses it to wake an idle app (egui runs a
+        /// frame only when something asks it to, so a file that arrives while the app sits
+        /// untouched would otherwise wait for the next touch).
+        pub fn intent_pending(&self) -> Result<usize, String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<usize> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it
+                    // without taking ownership or attempting to delete the reference.
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    let value = match env.call_method(
+                        &*activity,
+                        jni_str!("intentPending"),
+                        jni_sig!("()I"),
+                        &[],
+                    ) {
+                        Ok(value) => value.i()?,
+                        Err(error) => {
+                            // A missing `intentPending` leaves a pending NoSuchMethodError on the shared
+                            // JNI thread (which the SAF bridge also uses); clear it before returning.
+                            env.exception_clear();
+                            return Err(error);
+                        }
+                    };
+                    Ok(value.max(0) as usize)
+                })
+                .map_err(|e| e.to_string())
+        }
+
         pub fn files_dir(&self) -> Result<PathBuf, String> {
             self.vm
                 .attach_current_thread(|env| -> jni::errors::Result<PathBuf> {
@@ -321,6 +352,46 @@ mod saf {
             let _nonblocking = NonblockingCallbacks::enable();
             self.request_folder(id)?;
             self.wait_answer(id, timeout)
+        }
+
+        /// Blocking picker for a **worker thread**, while the frame thread keeps pumping the event
+        /// loop. Unlike [`Self::pick_blocking`], nothing here parks the frame thread: the app's
+        /// window/surface lifecycle (`Suspended`/`Resumed`) is delivered normally, so the renderer
+        /// tears down and rebuilds its surface around the picker instead of keeping a stale one
+        /// (which panics with `ERROR_NATIVE_WINDOW_IN_USE_KHR` on resume). Because the frame thread
+        /// is alive, the glue's lifecycle callbacks complete on their own — `NonblockingCallbacks`
+        /// must NOT be enabled here, and input is left to the frame thread's own iterator.
+        pub fn pick_blocking_worker(&self, id: u64, save_name: Option<&str>, timeout: Duration) -> Result<PickAnswer, String> {
+            match save_name {
+                Some(name) => self.request_save(id, name)?,
+                None => self.request_open(id, false)?,
+            }
+            self.wait_answer_worker(id, timeout)
+        }
+
+        fn wait_answer_worker(&self, id: u64, timeout: Duration) -> Result<PickAnswer, String> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                for raw in self.drain()? {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+                    if value.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+                        continue;
+                    }
+                    return match value.get("status").and_then(serde_json::Value::as_str).unwrap_or("error") {
+                        "ok" => Ok(PickAnswer::Paths(picker_paths(&value))),
+                        "cancel" => Ok(PickAnswer::Cancelled),
+                        _ => Err(value
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("the Android file picker failed")
+                            .to_owned()),
+                    };
+                }
+                if Instant::now() >= deadline {
+                    return Err("the Android file picker did not answer".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
         }
 
         fn wait_answer(&self, id: u64, timeout: Duration) -> Result<PickAnswer, String> {

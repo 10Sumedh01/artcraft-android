@@ -44,6 +44,13 @@ const SAF_BRIDGE_MARKER: &str = "ARTCRAFT_VECTORCRAFT_SAF_BRIDGE_V1";
 /// including the Android modifier-key fix and immersive fullscreen — is the one that is running.
 const ANDROID_SHELL_MARKER: &str = "ARTCRAFT_VECTORCRAFT_ANDROID_SHELL_V2_MODIFIERS_FULLSCREEN";
 
+/// Cleared when the app shuts down, so a background watcher stops talking to the Activity.
+///
+/// Android releases the Activity's Java object as soon as the native thread returns, so a
+/// watcher that kept asking it for files after that would call into a dead object. The flag is
+/// cleared when the app is dropped, which happens before the native thread returns.
+static ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 struct AndroidFileBridge {
     app: AndroidApp,
     vm: Arc<JavaVM>,
@@ -177,6 +184,35 @@ impl AndroidFileBridge {
             .map_err(|e| e.to_string())
     }
 
+    /// How many files the system (or a drop) handed us that the shell has not opened yet.
+    /// Asked without taking anything off the queue, so the frame that opens the file still
+    /// finds it there. The watcher's thread uses it to wake an idle app.
+    fn intent_pending(&self) -> Result<usize, String> {
+        self.vm
+            .attach_current_thread(|env| -> jni::errors::Result<usize> {
+                let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it
+                // without taking ownership or attempting to delete the reference.
+                let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                let value = match env.call_method(
+                    &*activity,
+                    jni_str!("intentPending"),
+                    jni_sig!("()I"),
+                    &[],
+                ) {
+                    Ok(value) => value.i()?,
+                    Err(error) => {
+                        // A missing `intentPending` leaves a pending NoSuchMethodError on the shared
+                        // JNI thread (which the SAF bridge also uses); clear it before returning.
+                        env.exception_clear();
+                        return Err(error);
+                    }
+                };
+                Ok(value.max(0) as usize)
+            })
+            .map_err(|e| e.to_string())
+    }
+
     fn files_dir(&self) -> Result<String, String> {
         self.vm
             .attach_current_thread(|env| -> jni::errors::Result<String> {
@@ -257,7 +293,7 @@ impl PickState {
 fn mime_for_filters(pick: &FilePick) -> String {
     pick.filters
         .first()
-        .and_then(|(_, exts)| exts.first().copied())
+        .and_then(|(_, exts)| exts.first().map(|s| s.as_str()))
         .map(mime_for_extension)
         .unwrap_or_else(|| "*/*".to_string())
 }
@@ -442,6 +478,30 @@ fn persist_read(dir: &Path, name: &str) -> Option<Vec<u8>> {
     fs::read(dir.join(name)).ok()
 }
 
+/// Ask the Activity whether this is a phone-class (small) screen, so the first launch can raise the
+/// app's UI scale to 150 % for phones while tablets are left at their own sizing. Returns `None`
+/// when the answer cannot be read, in which case the UI scale is left alone. Android's own
+/// form-factor test (`smallestScreenWidthDp < 600`, the `sw600dp` boundary) is used: it is stable
+/// across rotation and describes screen size rather than density.
+fn device_is_phone(app: &AndroidApp) -> Option<bool> {
+    // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
+    let jvm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut _) };
+    let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
+    let result = jvm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        let activity = unsafe { env.as_cast_raw::<jni::objects::JObject>(&activity_raw)? };
+        Ok(env
+            .call_method(&*activity, jni_str!("isPhoneDevice"), jni_sig!("()Z"), &[])?
+            .z()?)
+    });
+    match result {
+        Ok(is_phone) => Some(is_phone),
+        Err(error) => {
+            log::warn!("Could not determine the screen class: {error}");
+            None
+        }
+    }
+}
+
 /// Write `bytes` to `dir/name` through a temporary file renamed over the old one, so a crash leaves
 /// the old file or the new one whole, never a truncated one.
 fn persist_write(dir: &Path, name: &str, bytes: &[u8]) {
@@ -620,6 +680,36 @@ struct VectorCraftAndroidApp {
 /// Read the files the system asked this app to open (an `ACTION_VIEW`/`ACTION_SEND` it is registered
 /// for) into the app's import inbox, exactly like a document chosen in the picker. Each staged path
 /// is read once; a launcher without the intent host stops the poll after one error.
+/// Watch for files the system (or another app's drop) handed the app while it was idle.
+///
+/// egui runs a frame only when something asks it to, so a file that arrives while the app sits
+/// untouched would wait in the Activity's queue until the user happened to touch the screen. The
+/// watcher asks the Activity how many files are waiting (without taking any of them) and asks
+/// egui for a repaint when there is one, so the file opens on its own. The file itself is still
+/// opened on the frame thread, in `drain_incoming`.
+fn watch_incoming(bridge: &AndroidFileBridge, ctx: &egui::Context) {
+    static WATCHER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WATCHER.set(()).is_err() {
+        return;
+    }
+    let bridge = bridge.clone_for_services();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if !ALIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        match bridge.intent_pending() {
+            Ok(pending) if pending > 0 => ctx.request_repaint(),
+            Ok(_) => {}
+            Err(error) => {
+                log::info!("Launcher does not report incoming files: {error}");
+                break;
+            }
+        }
+    });
+}
+
 fn drain_incoming(bridge: &AndroidFileBridge, inbox: &Inbox, warmup: &mut i64) {
     if *warmup > 0 {
         *warmup -= 1;
@@ -752,12 +842,21 @@ impl VectorCraftAndroidApp {
     }
 }
 
+impl Drop for VectorCraftAndroidApp {
+    fn drop(&mut self) {
+        // The Activity is about to go: stop the watcher before the native thread returns.
+        ALIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl eframe::App for VectorCraftAndroidApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Deliver picker answers before the app's own logic runs, so `picks::poll` resumes the
         // entry that asked in this same frame.
         poll_answers(&self.picks, &self.bridge, ctx);
-        // Then deliver any file the system asked us to open, through the same inbox.
+        // Wake the app when a file the system handed us is waiting, then deliver it through the
+        // same inbox.
+        watch_incoming(&self.bridge, ctx);
         drain_incoming(&self.bridge, &self.intent_inbox, &mut self.intent_warmup);
         self.staged_prune_tick();
         self.inner.logic(ctx);
@@ -786,6 +885,11 @@ impl eframe::App for VectorCraftAndroidApp {
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("com.artcraft.vectorcraft"),
+    );
     log::info!("{SAF_BRIDGE_MARKER} ready; {ANDROID_SHELL_MARKER}; {}", ime_bridge::ime::IME_MARKER);
     egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
     install_persist_env(&android_app);
@@ -822,6 +926,12 @@ fn android_main(android_app: AndroidApp) {
             );
             let persist = persist_dir(&app_bridge.app);
             if let Some(dir) = &persist {
+                // First launch on a phone-class screen: raise the UI scale to 150 % before the app
+                // reads its settings, then save it, so a user who changes it later keeps their
+                // choice (this runs only while `ui.json` does not exist yet).
+                if !dir.join("ui.json").exists() && device_is_phone(&app_bridge.app) == Some(true) {
+                    let _ = app.session.execute("prefs.set", &serde_json::json!({"key": "uiScaling", "value": 1.5}));
+                }
                 persist_load(&mut app, dir);
             }
             Ok(Box::new(VectorCraftAndroidApp {

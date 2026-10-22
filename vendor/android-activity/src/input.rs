@@ -381,6 +381,42 @@ pub enum ToolType {
     __Unknown(u32),
 }
 
+/// The classification of the gesture a motion event belongs to.
+///
+/// A hardware touchpad's gestures are reported as motion events with a classification:
+/// a two-finger slide is a swipe, a two-finger pinch is a pinch, and a tap is neither.
+/// It is what tells a gesture apart from a plain press, which looks the same on the
+/// wire.
+///
+/// See [the MotionEvent docs](https://developer.android.com/reference/android/view/MotionEvent#getClassification()).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, num_enum::FromPrimitive, num_enum::IntoPrimitive)]
+#[non_exhaustive]
+#[repr(u32)]
+pub enum Classification {
+    /// No additional information is available about the current motion event stream.
+    None = 0,
+
+    /// The user's intent is not yet determined: the event stream will eventually resolve
+    /// into one of the other classifications.
+    AmbiguousGesture = 1,
+
+    /// The user is intentionally pressing harder on the screen.
+    DeepPress = 2,
+
+    /// The user is swiping with two fingers on a touchpad.
+    TwoFingerSwipe = 3,
+
+    /// The user is swiping with three or more fingers on a touchpad.
+    MultiFingerSwipe = 4,
+
+    /// The user is pinching with two fingers on a touchpad.
+    Pinch = 5,
+
+    #[doc(hidden)]
+    #[num_enum(catch_all)]
+    __Unknown(u32),
+}
+
 /// A bitfield representing the state of buttons during a motion event.
 ///
 /// See [the NDK docs](https://developer.android.com/ndk/reference/group/input#anonymous-enum-33)

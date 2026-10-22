@@ -109,12 +109,25 @@ if [[ -n "$APPNAME" ]]; then TITLE="$APPNAME"; fi
 
 SRC="source/$APP"
 REPO="https://github.com/storytold/$APP.git"
+
+# The builder's own version, baked into every APK. The app compares it with the latest GitHub
+# release of this repository on launch and offers the download when GitHub has a newer one
+# (see templates/android/UpdateCheck.java). Bump it when a release is published.
+BUILDER_VERSION="0.2.0"
+UPDATE_API_URL="https://api.github.com/repos/MostafaXS1/artcraft-android/releases/latest"
+UPDATE_PAGE_URL="https://github.com/MostafaXS1/artcraft-android/releases/latest"
+
 # Absolute: the build later `cd`s into the launcher directory, and cargo-ndk/Gradle paths
 # derived from $ANDROID_DIR must keep resolving from there.
 ANDROID_DIR="$ROOT/$SRC/apps/$APP-android"
 mkdir -p source build output logs keys adapters
 
 say() { printf '\n[%s] %s\n' "$1" "$2"; }
+
+# A command that fails on its own (not one the script handles with `|| true`, `if`, or a `case`)
+# would otherwise stop the build without a word, leaving only the last progress line in the log.
+# Name the failing line instead, so the log always says what went wrong.
+trap 'rc=$?; echo >&2; echo "ERROR: the build stopped at line $LINENO: $BASH_COMMAND (exit $rc)" >&2; echo "No source checkout or existing project files were deleted." >&2; exit $rc' ERR
 
 fail() {
     echo >&2
@@ -300,6 +313,27 @@ if command -v rustup >/dev/null 2>&1 && ! rustup target list --installed | grep 
 fi
 
 say 3 "Fetching official source for $TITLE..."
+
+# A checkout is only usable when every tracked file of the workspace is actually on disk.
+# `git clone` can be interrupted (a killed build, a full disk) after it has written the commit
+# and the origin but before it has written the whole tree. Git then reports a perfectly normal
+# origin and commit while the working tree is missing most of the crates, and reusing such a
+# checkout fails much later with a misleading "this app needs an app-specific adapter" message.
+# The tree is therefore verified here, where the real cause is still obvious.
+#
+# Only `crates/` and `apps/` are checked: those are the directories the workspace is made of,
+# and the builder never removes files from them (it only replaces `vendor/`, which Git tracks
+# but the build overwrites anyway).
+source_tree_is_complete() {
+    local dir="$1" missing
+    [[ -d "$dir/.git" ]] || return 1
+    git -C "$dir" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
+    missing="$(git -C "$dir" ls-tree -r --name-only HEAD -- crates apps 2>/dev/null | while IFS= read -r f; do
+        [[ -e "$dir/$f" ]] || printf '%s\n' "$f"
+    done | head -5)"
+    [[ -z "$missing" ]]
+}
+
 if [[ -e "$SRC" ]]; then
     [[ -d "$SRC/.git" ]] || fail "$SRC exists but is not a Git checkout. Move it aside manually before retrying."
     ORIGIN="$(git -C "$SRC" remote get-url origin 2>/dev/null || true)"
@@ -307,11 +341,33 @@ if [[ -e "$SRC" ]]; then
         "https://github.com/storytold/$APP") ;;
         *) fail "$SRC has unexpected origin '$ORIGIN'; refusing to reuse or overwrite it." ;;
     esac
+    if ! source_tree_is_complete "$SRC"; then
+        fail "$SRC is an incomplete checkout: some files of the workspace are missing on disk. That happens when a clone is interrupted (a killed build, or a full disk). Move $SRC aside and run the build again to re-clone it."
+    fi
     echo "Reusing existing source checkout (including your Android port changes)."
     echo "Commit: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "Source is not automatically reset or updated."
 else
-    git clone --depth 1 "$REPO" "$SRC"
+    # The clone goes into a scratch directory first and is only moved into place once the tree
+    # has been verified, so an interrupted clone can never become the checkout a later build
+    # reuses. `df` is checked up front as well: a clone that runs out of disk is the usual
+    # reason for an incomplete tree in the first place.
+    SRC_TMP="$ROOT/source/.clone-$APP.$$"
+    rm -rf "$SRC_TMP"
+    FREE_BYTES="$(df -k "$ROOT/source" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')"
+    if [[ "$FREE_BYTES" =~ ^[0-9]+$ ]] && (( FREE_BYTES < 1048576000 )); then
+        rm -rf "$SRC_TMP"
+        fail "Only $((FREE_BYTES / 1048576)) MiB are free on the disk holding $ROOT/source, but cloning $TITLE needs about 1 GiB. Free some space (build/ holds the Cargo output of every app) and run the build again."
+    fi
+    if ! git clone --depth 1 "$REPO" "$SRC_TMP"; then
+        rm -rf "$SRC_TMP"
+        fail "Cloning $REPO failed. Check the network connection and the free disk space, then run the build again."
+    fi
+    if ! source_tree_is_complete "$SRC_TMP"; then
+        rm -rf "$SRC_TMP"
+        fail "The clone of $REPO came back incomplete: some files of the workspace are missing on disk. That usually means the disk filled up during the clone. Free some space and run the build again."
+    fi
+    mv "$SRC_TMP" "$SRC"
 fi
 
 # Upstream `main` is normally green, but a regression can sit there for a while (the upstream
@@ -356,6 +412,12 @@ if fixed:
     print(f"  Repaired upstream compile errors still present in {title}: {', '.join(fixed)}")
 PY
 
+# Two-finger scrolling (the app-side gesture guard and the momentum hand-off) is applied by its
+# own script, so it can be turned off for testing by commenting out the line below. It patches the
+# app's own source at build time; the scroll synthesis itself is the vendored winit/egui-winit
+# backends above.
+bash "$ROOT/lib/scrolling.sh" "$SRC" "$APP" "$TITLE"
+
 say 4 "Preparing the GameActivity launcher..."
 if [[ -x "adapters/$APP/prepare.sh" ]]; then
     echo "Using app-specific adapter: adapters/$APP/prepare.sh"
@@ -377,7 +439,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "32"
+GENERATOR_VERSION = "41"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -410,6 +472,14 @@ if android_dir.exists():
     if marker.is_file():
         if marker.read_text(errors="replace").splitlines()[:1] == [GENERATOR_VERSION]:
             print("Android launcher already generated; preserving it.")
+            # The shared modules are refreshed even when the launcher itself is kept: they are
+            # copied into it rather than generated, so a change to one of them (the system-font
+            # bridge, the soft-keyboard bridge) has to reach the launcher that is already there.
+            for shared in ("system_fonts.rs", "ime_bridge.rs"):
+                src_shared = root / "templates" / "android" / shared
+                dst_shared = android_dir / "src" / shared
+                if src_shared.is_file() and dst_shared.parent.is_dir():
+                    shutil.copy2(src_shared, dst_shared)
             raise SystemExit(0)
         print("Regenerating the Android launcher for this builder version.")
         shutil.rmtree(android_dir)
@@ -434,6 +504,17 @@ ui_manifest = src / "crates" / "ui-egui" / "Cargo.toml"
 ui_src = src / "crates" / "ui-egui" / "src"
 for p in (engine_manifest, ui_manifest, ui_src / "lib.rs"):
     if not p.exists():
+        # The shared layout is what every app of the suite is expected to have. A checkout that
+        # is missing it is far more often an interrupted clone than an app with a different
+        # layout, so say which of the two it is instead of pointing at the adapter.
+        crates = src / "crates"
+        present = sorted(d.name for d in crates.iterdir() if d.is_dir()) if crates.is_dir() else []
+        if len(present) < 5:
+            raise SystemExit(
+                f"The source checkout is incomplete: crates/ holds {len(present)} directories "
+                f"({', '.join(present) if present else 'none'}) instead of the full workspace. "
+                f"Move {src} aside and run the build again to re-clone it."
+            )
         raise SystemExit(f"Expected shared engine/UI layout is missing: {p.relative_to(src)}. This app needs an app-specific adapter under adapters/{app}/.")
 
 def pkg_name(path: Path) -> str:
@@ -466,7 +547,11 @@ SPECIAL = {
     "figcraft": {"app_type": "FigApp", "construct": "{app}::new(Session::new(), Box::new(NoServices))"},
     "wordcraft": {
         "app_type": "WordApp",
-        "construct": "{app}::new(Session::new({engine}::sample::sample_document()), Services::default())",
+        # Android starts at Word's File › Home start screen (Blank document, the templates and
+        # Recent) instead of a blank document or the "The Open Studio Handbook" sample, which made
+        # the app look like it had opened someone else's file. `WordApp::new` never shows the start
+        # screen itself, so we call `start_screen()` after building the app (see `create_hook`).
+        "construct": "{app}::new(Session::new({engine}::blank_document(&{engine}::Region::default())), Services::default())",
     },
     "soundcraft": {"app_type": "SoundApp", "construct": "{app}::new({engine}::Engine::default(), None, Services::default())"},
     "cadcraft": {"app_type": "CadApp", "construct": "{app}::new(Session::empty(), Services::default())"},
@@ -564,6 +649,44 @@ pub struct SafState {
     next_id: AtomicU64,
     requests: Mutex<HashMap<u64, ImportRequest>>,
     saves: Mutex<HashMap<u64, Vec<u8>>>,
+    mirror: saf::SaveMirror,
+}
+
+/// Pick a file (or a folder-free `open`) and block until the user answers. Safe because the SAF
+/// bridge makes a frame-thread wait non-blocking for the JVM callbacks (`NonblockingCallbacks`),
+/// and the pick has its own timeout. `None` on cancel or error. The path is the staged app-private
+/// copy DesignCraft reads.
+fn saf_pick_open(bridge: &saf::Bridge, state: &SafState) -> Option<String> {
+    let id = saf_next_id(state);
+    match bridge.pick_blocking(id, None, saf::PICK_TIMEOUT) {
+        Ok(saf::PickAnswer::Paths(paths)) => paths.into_iter().next(),
+        Ok(saf::PickAnswer::Cancelled) => None,
+        Err(error) => {
+            log::error!("Android open picker: {error}");
+            None
+        }
+    }
+}
+
+/// Save dialog: the staged app-private destination, watched so the app's own write is mirrored to
+/// the chosen SAF document on the next frames (DesignCraft's file API is path-based). `None` on
+/// cancel.
+fn saf_pick_save(bridge: &saf::Bridge, state: &SafState, name: &str) -> Option<String> {
+    let id = saf_next_id(state);
+    match bridge.pick_blocking(id, Some(name), saf::PICK_TIMEOUT) {
+        Ok(saf::PickAnswer::Paths(paths)) => {
+            let path = paths.into_iter().next();
+            if let Some(path) = &path {
+                state.mirror.track(id, path);
+            }
+            path
+        }
+        Ok(saf::PickAnswer::Cancelled) => None,
+        Err(error) => {
+            log::error!("Android save picker: {error}");
+            None
+        }
+    }
 }
 
 pub fn saf_new_state() -> Arc<SafState> {
@@ -594,11 +717,20 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
     let open_bridge = bridge.clone_ref();
     let save_bridge = bridge.clone_ref();
     let write_bridge = bridge.clone_ref();
+    let pick_open_bridge = bridge.clone_ref();
+    let pick_save_bridge = bridge.clone_ref();
     let open_state = Arc::clone(&state);
     let save_state = Arc::clone(&state);
+    let pick_open_state = Arc::clone(&state);
+    let pick_save_state = Arc::clone(&state);
     Services {
         read: Some(Box::new(|path: &str| std::fs::read(path).map_err(|error| format!("Could not read {path}: {error}")))),
         write: Some(Box::new(move |path: &str, bytes: &[u8]| saf_write_and_commit(&write_bridge, path, bytes))),
+        // Save / Save As / Export go through the synchronous `pick_save`, which Android never
+        // provided, so those menu items were a silent no-op. The picker blocks on the frame thread,
+        // which the SAF bridge makes safe (`NonblockingCallbacks`), exactly as EffectCraft does.
+        pick_open: Some(Box::new(move |_purpose: &str| saf_pick_open(&pick_open_bridge, &pick_open_state))),
+        pick_save: Some(Box::new(move |name: &str| saf_pick_save(&pick_save_bridge, &pick_save_state, name))),
         open_async: Some(Box::new(move |request: ImportRequest| {
             let id = saf_next_id(&open_state);
             open_state.requests.lock().unwrap_or_else(|error| error.into_inner()).insert(id, request);
@@ -694,6 +826,9 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, inbox: &SafInbox) {
             }
         }
     }
+    // A save through `pick_save` is written by the app itself to the staged path; push it to the
+    // chosen SAF document once the write lands.
+    state.mirror.sync(bridge);
 }
 ''',
     },
@@ -707,6 +842,7 @@ pub type SafInbox = deckcraft_ui_egui::Inbox;
 pub struct SafState {
     next_id: AtomicU64,
     saves: Mutex<HashMap<u64, Vec<u8>>>,
+    mirror: saf::SaveMirror,
 }
 
 pub fn saf_new_state() -> Arc<SafState> {
@@ -731,17 +867,62 @@ fn saf_write_and_commit(bridge: &saf::Bridge, path: &str, bytes: &[u8]) -> Resul
         status => Err(format!("Unexpected Android save result: {status}")),
     }
 }
+
+/// Pick a file to open and block until the user answers. Safe because the SAF bridge makes a
+/// frame-thread wait non-blocking for the JVM callbacks (`NonblockingCallbacks`), and the pick has
+/// its own timeout. `None` on cancel or error; the path is the staged app-private copy.
+fn saf_pick_open(bridge: &saf::Bridge, state: &SafState) -> Option<String> {
+    let id = saf_next_id(state);
+    match bridge.pick_blocking(id, None, saf::PICK_TIMEOUT) {
+        Ok(saf::PickAnswer::Paths(paths)) => paths.into_iter().next(),
+        Ok(saf::PickAnswer::Cancelled) => None,
+        Err(error) => {
+            log::error!("Android open picker: {error}");
+            None
+        }
+    }
+}
+
+/// Save dialog: the staged app-private destination, watched so the app's own write is mirrored to
+/// the chosen SAF document on the next frames (DeckCraft's file API is path-based). `None` on
+/// cancel.
+fn saf_pick_save(bridge: &saf::Bridge, state: &SafState, name: &str) -> Option<String> {
+    let id = saf_next_id(state);
+    match bridge.pick_blocking(id, Some(name), saf::PICK_TIMEOUT) {
+        Ok(saf::PickAnswer::Paths(paths)) => {
+            let path = paths.into_iter().next();
+            if let Some(path) = &path {
+                state.mirror.track(id, path);
+            }
+            path
+        }
+        Ok(saf::PickAnswer::Cancelled) => None,
+        Err(error) => {
+            log::error!("Android save picker: {error}");
+            None
+        }
+    }
+}
 ''',
         "services": '''
 fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> Services {
     let open_bridge = bridge.clone_ref();
     let save_bridge = bridge.clone_ref();
     let write_bridge = bridge.clone_ref();
+    let pick_open_bridge = bridge.clone_ref();
+    let pick_save_bridge = bridge.clone_ref();
     let open_inbox = inbox.clone();
     let save_state = Arc::clone(&state);
+    let pick_open_state = Arc::clone(&state);
+    let pick_save_state = Arc::clone(&state);
     Services {
         read: Some(Box::new(|path: &str| std::fs::read(path).map_err(|error| format!("Could not read {path}: {error}")))),
         write: Some(Box::new(move |path: &str, bytes: &[u8]| saf_write_and_commit(&write_bridge, path, bytes))),
+        // Save As / Export use the synchronous `pick_save`, which Android never provided, so those
+        // menu items were a silent no-op. The picker blocks on the frame thread, which the SAF
+        // bridge makes safe (`NonblockingCallbacks`), exactly as EffectCraft does.
+        pick_open: Some(Box::new(move |_purpose: &str| saf_pick_open(&pick_open_bridge, &pick_open_state))),
+        pick_save: Some(Box::new(move |name: &str| saf_pick_save(&pick_save_bridge, &pick_save_state, name))),
         open_async: Some(Box::new(move |_purpose: &str, id: u64| {
             // DeckCraft hands us the request id it already tracks; echo it back on completion.
             if let Err(error) = open_bridge.request_open(id, false) {
@@ -840,6 +1021,9 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, inbox: &SafInbox) {
             }
         }
     }
+    // A save through `pick_save` is written by the app itself to the staged path; push it to the
+    // chosen SAF document once the write lands.
+    state.mirror.sync(bridge);
 }
 ''',
     },
@@ -856,6 +1040,7 @@ pub struct SafState {
     /// or a dialog's private inbox for its picture picker.
     opens: Mutex<HashMap<u64, SafInbox>>,
     saves: Mutex<HashMap<u64, Vec<u8>>>,
+    mirror: saf::SaveMirror,
 }
 
 pub fn saf_new_state() -> Arc<SafState> {
@@ -880,17 +1065,62 @@ fn saf_write_and_commit(bridge: &saf::Bridge, path: &str, bytes: &[u8]) -> Resul
         status => Err(format!("Unexpected Android save result: {status}")),
     }
 }
+
+/// Pick a file to open and block until the user answers. Safe because the SAF bridge makes a
+/// frame-thread wait non-blocking for the JVM callbacks (`NonblockingCallbacks`), and the pick has
+/// its own timeout. `None` on cancel or error; the path is the staged app-private copy.
+fn saf_pick_open(bridge: &saf::Bridge, state: &SafState) -> Option<String> {
+    let id = saf_next_id(state);
+    match bridge.pick_blocking(id, None, saf::PICK_TIMEOUT) {
+        Ok(saf::PickAnswer::Paths(paths)) => paths.into_iter().next(),
+        Ok(saf::PickAnswer::Cancelled) => None,
+        Err(error) => {
+            log::error!("Android open picker: {error}");
+            None
+        }
+    }
+}
+
+/// Save dialog: the staged app-private destination, watched so the app's own write is mirrored to
+/// the chosen SAF document on the next frames (GridCraft's file API is path-based). `None` on
+/// cancel.
+fn saf_pick_save(bridge: &saf::Bridge, state: &SafState, name: &str) -> Option<String> {
+    let id = saf_next_id(state);
+    match bridge.pick_blocking(id, Some(name), saf::PICK_TIMEOUT) {
+        Ok(saf::PickAnswer::Paths(paths)) => {
+            let path = paths.into_iter().next();
+            if let Some(path) = &path {
+                state.mirror.track(id, path);
+            }
+            path
+        }
+        Ok(saf::PickAnswer::Cancelled) => None,
+        Err(error) => {
+            log::error!("Android save picker: {error}");
+            None
+        }
+    }
+}
 ''',
         "services": '''
 fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> Services {
     let open_bridge = bridge.clone_ref();
     let picture_bridge = bridge.clone_ref();
     let save_bridge = bridge.clone_ref();
+    let pick_open_bridge = bridge.clone_ref();
+    let pick_save_bridge = bridge.clone_ref();
     let open_state = Arc::clone(&state);
     let picture_state = Arc::clone(&state);
     let save_state = Arc::clone(&state);
+    let pick_open_state = Arc::clone(&state);
+    let pick_save_state = Arc::clone(&state);
     let open_inbox = inbox.clone();
     Services {
+        // Save As / Export use the synchronous `pick_save`, which Android never provided, so those
+        // menu items were a silent no-op. The picker blocks on the frame thread, which the SAF
+        // bridge makes safe (`NonblockingCallbacks`), exactly as EffectCraft does.
+        pick_open: Some(Box::new(move || saf_pick_open(&pick_open_bridge, &pick_open_state))),
+        pick_save: Some(Box::new(move |name: &str| saf_pick_save(&pick_save_bridge, &pick_save_state, name))),
         open_async: Some(Box::new(move || {
             let id = saf_next_id(&open_state);
             open_state.opens.lock().unwrap_or_else(|error| error.into_inner()).insert(id, open_inbox.clone());
@@ -996,19 +1226,70 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, _inbox: &SafInbox) {
             }
         }
     }
+    // A save through `pick_save` is written by the app itself to the staged path; push it to the
+    // chosen SAF document once the write lands.
+    state.mirror.sync(bridge);
 }
 ''',
     },
     "wordcraft": {
         "activity": "WordCraftActivity",
-        "imports": "use std::collections::HashMap;\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::sync::{Arc, Mutex};",
+        "imports": "use std::sync::atomic::{AtomicU64, Ordering};\nuse std::sync::Arc;",
         "state": '''
 pub type SafInbox = wordcraft_ui_egui::Inbox;
 
 #[derive(Default)]
 pub struct SafState {
     next_id: AtomicU64,
-    saves: Mutex<HashMap<u64, Vec<u8>>>,
+    mirror: saf::SaveMirror,
+}
+
+/// Show WordCraft's native file dialog without blocking the frame loop (#94, #511). WordCraft has
+/// an asynchronous dialog API (`Services::file_dialog`) that exists for exactly this: the pick runs
+/// on a worker thread and the app picks the answer up on a later frame (`poll_file_dialog`).
+///
+/// Blocking the frame thread instead is what broke Save As / Open / Export on Android: the frame
+/// thread *is* the event-loop pump, so while it was parked the app never received Android's
+/// `Suspended` lifecycle event and its wgpu surface was never torn down. On resume Android hands
+/// over a new `ANativeWindow`, and recreating the surface for a window that still had a live
+/// `VkSurfaceKHR` aborted the process with `AndroidSurface failed: ERROR_NATIVE_WINDOW_IN_USE_KHR`.
+fn saf_file_dialog(
+    bridge: saf::Bridge,
+    state: Arc<SafState>,
+    request: wordcraft_ui_egui::FileDialogRequest,
+) -> std::sync::mpsc::Receiver<wordcraft_ui_egui::FileDialogAnswer> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let id = saf_next_id(&state);
+        let (save_name, timeout) = match &request {
+            // `..` and not a field list: the request has gained fields over time (the
+            // folder the picker starts in, `dir`), and the launcher only cares about the
+            // name, so it must not break when the source adds another one.
+            wordcraft_ui_egui::FileDialogRequest::Save { name, .. } => (Some(name.as_str()), saf::PICK_TIMEOUT),
+            // Every other request is an open; the catch-all keeps this working whether the
+            // source has one open variant or several (`Open`, `OpenMany`).
+            _ => (None, saf::PICK_TIMEOUT),
+        };
+        let answer = match bridge.pick_blocking_worker(id, save_name, timeout) {
+            Ok(saf::PickAnswer::Paths(paths)) => {
+                // WordCraft's file API is path-based: it writes the document itself, so watch the
+                // staged save destination and mirror the write to the chosen SAF document later.
+                if save_name.is_some() {
+                    if let Some(path) = paths.first() {
+                        state.mirror.track(id, path);
+                    }
+                }
+                PICKED_PATHS
+            }
+            Ok(saf::PickAnswer::Cancelled) => PICK_CANCELLED,
+            Err(error) => {
+                log::error!("Android file picker: {error}");
+                Err(error)
+            }
+        };
+        let _ = tx.send(answer);
+    });
+    rx
 }
 
 pub fn saf_new_state() -> Arc<SafState> {
@@ -1018,46 +1299,33 @@ pub fn saf_new_state() -> Arc<SafState> {
 fn saf_next_id(state: &SafState) -> u64 {
     state.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
-
-/// Write to the staged private path, then push it through SAF when it was a chosen save
-/// destination (a plain private path is a no-op commit).
-fn saf_write_and_commit(bridge: &saf::Bridge, path: &str, bytes: &[u8]) -> Result<(), String> {
-    let target = std::path::Path::new(path);
-    if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
-    }
-    std::fs::write(target, bytes).map_err(|error| format!("Could not write {}: {error}", target.display()))?;
-    match bridge.commit(path)? {
-        status if status == "NONE" || status == "OK" => Ok(()),
-        status if status.starts_with("ERROR:") => Err(status.trim_start_matches("ERROR:").trim().to_owned()),
-        status => Err(format!("Unexpected Android save result: {status}")),
-    }
-}
 ''',
         "services": '''
 fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> Services {
-    let open_bridge = bridge.clone_ref();
     let print_bridge = bridge.clone_ref();
-    let save_bridge = bridge.clone_ref();
-    let open_state = Arc::clone(&state);
-    let save_state = Arc::clone(&state);
+    let dialog_bridge = bridge.clone_ref();
+    let dialog_state = Arc::clone(&state);
     Services {
-        open_async: Some(Box::new(move |_purpose: &str| {
-            let id = saf_next_id(&open_state);
-            if let Err(error) = open_bridge.request_open(id, false) {
-                log::error!("Could not start the Android open picker: {error}");
-            }
+        // Open / Save As / Export go through `ask_file`, which prefers this asynchronous dialog
+        // (see `saf_file_dialog`): the pick runs off the frame thread, so the event loop keeps
+        // pumping Android's lifecycle and the renderer swaps its surface safely around the picker.
+        // A synchronous `pick_open`/`pick_save` here would park the frame thread and crash on a
+        // surface that was never torn down (`ERROR_NATIVE_WINDOW_IN_USE_KHR`).
+        file_dialog: Some(Box::new(move |request: wordcraft_ui_egui::FileDialogRequest| {
+            saf_file_dialog(dialog_bridge.clone_ref(), Arc::clone(&dialog_state), request)
         })),
-        download: Some(Box::new(move |name: &str, bytes: &[u8]| {
-            let id = saf_next_id(&save_state);
-            save_state.saves.lock().unwrap_or_else(|error| error.into_inner()).insert(id, bytes.to_vec());
-            if let Err(error) = save_bridge.request_save(id, name) {
-                log::error!("Could not start the Android save picker: {error}");
-                save_state.saves.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
-                return Err(error);
-            }
-            Ok(())
-        })),
+        // NOTE: no `open_async`. Every dialog — Open, Insert/Change Picture, Add Font, recipients,
+        // Save As, Export, Print-to-PDF — goes through `file_dialog` above, so the app knows what
+        // each picked file is for (`AfterPick`) and there is exactly one place that consumes picker
+        // answers (the dialog's worker thread). `open_async` would answer through `inbox` instead,
+        // competing with the worker for the same answer queue.
+        //
+        // NOTE: no `download` service. `download` is the browser's save mechanism: when it is set,
+        // `file.save`/`file.saveAs`/`file.exportPdf`/`file.exportPng` ignore the picked path and
+        // ask a second save dialog for the bytes, so exporting opened the picker twice (the first
+        // destination stayed empty). Android saves like the desktop does — the engine writes to the
+        // picked path and `SaveMirror` commits that staged file to the chosen SAF document — so the
+        // path-based `file_dialog` above does the whole job with one dialog.
         // Android keeps printer choice inside the system print dialog: it reaches every printer
         // the device knows (Wi-Fi, network, cloud print services), not just ones an in-app list
         // could discover itself. Offer exactly that one entry — named and defaulted so File >
@@ -1096,73 +1364,12 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
 }
 ''',
         "poll": '''
-fn saf_poll(bridge: &saf::Bridge, state: &SafState, inbox: &SafInbox) {
-    for _ in 0..16 {
-        let raw = match bridge.poll() {
-            Ok(Some(raw)) => raw,
-            Ok(None) => break,
-            Err(error) => {
-                log::error!("Could not poll the Android file picker: {error}");
-                break;
-            }
-        };
-        let value: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(error) => {
-                log::error!("Ignoring a malformed Android picker result ({error}): {raw}");
-                continue;
-            }
-        };
-        let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) else { continue };
-        let kind = value.get("kind").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let status = value.get("status").and_then(serde_json::Value::as_str).unwrap_or("error");
-        match (kind, status) {
-            ("open", "ok") => {
-                let paths: Vec<String> = value
-                    .get("paths")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry.as_str().map(str::to_owned))
-                    .collect();
-                for path in paths {
-                    match std::fs::read(&path) {
-                        Ok(bytes) => {
-                            let name = std::path::Path::new(&path)
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "imported-file".to_owned());
-                            inbox.lock().unwrap_or_else(|error| error.into_inner()).push((name, bytes));
-                        }
-                        Err(error) => log::error!("Could not read the picked file {path}: {error}"),
-                    }
-                }
-            }
-            ("open", "cancel") => {}
-            ("save", "ok") => {
-                let bytes = state.saves.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
-                if let Some(bytes) = bytes {
-                    match value.get("path").and_then(serde_json::Value::as_str) {
-                        Some(path) => {
-                            if let Err(error) = saf_write_and_commit(bridge, path, &bytes) {
-                                log::error!("Could not write the saved file: {error}");
-                            }
-                        }
-                        None => log::error!("Android save picker returned no destination path"),
-                    }
-                }
-            }
-            ("save", "cancel") => {
-                state.saves.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
-            }
-            _ => {
-                if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
-                    log::error!("Android file picker error: {message}");
-                }
-                state.saves.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
-            }
-        }
-    }
+fn saf_poll(bridge: &saf::Bridge, state: &SafState, _inbox: &SafInbox) {
+    // Picker answers are consumed by the dialog's worker thread (`wait_answer_worker`), never here:
+    // both would `poll()` the same queue and the frame could steal the answer the dialog is waiting
+    // for. The frame only mirrors a finished path-based save to its chosen SAF document, once the
+    // engine has written the staged file.
+    state.mirror.sync(bridge);
 }
 ''',
     },
@@ -1546,6 +1753,25 @@ impl Services for SafServices {
     },
 }
 
+# WordCraft's file-dialog answer type changed upstream: it used to be a single optional path
+# (`Result<Option<String>, String>`) and is now the list of picked paths, empty when the user
+# cancelled (`Result<Vec<String>, String>`), so that "Add Font…" can pick several files. The
+# picker's answer is written in whichever shape the checked-out source expects, so the launcher
+# keeps building against both.
+_answer_type = re.search(r"pub type FileDialogAnswer\s*=\s*Result<\s*(\w+)", ui_text)
+if _answer_type and _answer_type.group(1) == "Option":
+    SAF_RECIPES["wordcraft"]["state"] = (
+        SAF_RECIPES["wordcraft"]["state"]
+        .replace("PICKED_PATHS", "Ok(paths.into_iter().next())")
+        .replace("PICK_CANCELLED", "Ok(None)")
+    )
+else:
+    SAF_RECIPES["wordcraft"]["state"] = (
+        SAF_RECIPES["wordcraft"]["state"]
+        .replace("PICKED_PATHS", "Ok(paths)")
+        .replace("PICK_CANCELLED", "Ok(Vec::new())")
+    )
+
 # How the launcher opens a document the system handed it (an ACTION_VIEW/ACTION_SEND intent it is
 # registered for), once per staged file. Each entry is the body of the shell's `open_incoming`, so it
 # can use `self.inner`, `self.saf_inbox` and the `saf` bridge helpers. Apps with an import inbox
@@ -1774,6 +2000,71 @@ PERSIST_RECIPES = {
     },
 }
 
+# ---- First-launch UI scale on small screens ----------------------------------------------------
+# On a phone-class screen (smallestScreenWidthDp < 600, Android's own sw600dp tablet boundary —
+# see SafActivity.isPhoneDevice) the desktop-sized interface is uncomfortably small, so the *first*
+# launch raises the app's UI scale to 150%. Tablets, and every later launch, are left exactly as the
+# user set them: the bootstrap only runs when this app's own settings file does not exist yet.
+#
+# The apps do not share one scale key or representation (int percent, choice string, f32 factor,
+# `InterfaceSize` percentage), so each entry below spells out, per app:
+#   "file"  — a settings file whose absence means "first launch".
+#   "set"   — Rust run once after `persist_load`, against the loaded app state, to raise the scale.
+# Apps with no persisted interface scale (lightcraft, figcraft, cadcraft) are absent and are
+# untouched. `@UI@`/`@ENGINE@` are filled in like the recipes above.
+UI_SCALE_BOOTSTRAP = {
+    "effectcraft": {
+        "file": "prefs.json",
+        # EffectCraft stores prefs through `DirConfig`; `prefs.set` clamps to 75–200 %.
+        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
+    },
+    "filmcraft": {
+        "file": "preferences.json",
+        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
+    },
+    "vectorcraft": {
+        "file": "ui.json",
+        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "uiScaling", "value": 1.5}));''',
+    },
+    "wordcraft": {
+        "file": "ui.json",
+        "set": '''inner.ui.interface_size = @UI@::theme::InterfaceSize::from_percent(150.0).unwrap_or_default();''',
+    },
+    "designcraft": {
+        "file": "ui.json",
+        "set": '''inner.ui.ui_scale = 1.5;''',
+    },
+    "deckcraft": {
+        "file": "ui.json",
+        "set": '''inner.ui.ui_scale = 1.5;''',
+    },
+    "soundcraft": {
+        "file": "ui.json",
+        # SoundCraft's slider tops out at 1.5, so 150 % is its maximum.
+        "set": '''inner.ui.ui_scale = 1.5;''',
+    },
+    "gridcraft": {
+        "file": "ui.json",
+        "set": '''inner.ui.interface_scale = 150;''',
+    },
+    "pdfcraft": {
+        "file": "ui.json",
+        "set": '''inner.ui_scale = @UI@::ui_scale::valid(1.5);''',
+    },
+}
+
+# Run once right after `persist_load`, to open a launch on the app's own homepage instead of an
+# empty document. The desktop apps do this in their `main.rs` (Word: a Start screen when launched
+# without a document, `#766`; the rest open the File tab's Backstage Home). The generated launcher
+# reaches the same public method/command, so a launch shows Blank document / templates / Recent —
+# and nothing the loader applied can overwrite it, since it runs after `persist_load`.
+# `@UI@` becomes the app's UI crate ident, like the recipes above.
+PERSIST_AFTER_LOAD = {
+    "wordcraft": "            inner.start_screen();\n",
+    "gridcraft": "            inner.open_backstage(@UI@::backstage::Page::Home);\n",
+    "deckcraft": "            inner.open_backstage(@UI@::backstage::Page::Home);\n",
+}
+
 # Shared Rust helpers the recipes above call (single braces: not interpolated as format fields).
 PERSIST_SUPPORT = r'''
 /// The app's private storage directory. Android exposes two: the internal one
@@ -1961,7 +2252,38 @@ fn persist_save(inner: &mut {app_type}, dir: &std::path::Path) {{
 }}
 '''
     persist_fields = "\n    persist: Option<std::path::PathBuf>,\n    persist_last: Option<std::time::Instant>,"
-    persist_new_body = "let persist = persist_dir(&app);\n        if let Some(dir) = &persist {\n            persist_load(&mut inner, dir);\n        }\n        "
+    # Open a launch on the app's own homepage (see PERSIST_AFTER_LOAD); runs after `persist_load`.
+    _after = PERSIST_AFTER_LOAD.get(app, "").replace("@UI@", ui_ident)
+    _bootstrap = UI_SCALE_BOOTSTRAP.get(app)
+    if _bootstrap:
+        # Run only on a true first launch (this app's settings file still absent) on a phone-class
+        # screen. The set runs *after* `persist_load` so nothing the loader applies can overwrite it,
+        # then `persist_save` writes it at once; a present file means the bootstrap never runs again,
+        # so a user who changes the scale later keeps their choice.
+        _set = _bootstrap["set"].replace("@UI@", ui_ident).replace("@ENGINE@", engine_ident)
+        _bootstrap_body = (
+            "let persist = persist_dir(&app);\n"
+            "        if let Some(dir) = &persist {\n"
+            f'            let scale_first_launch = !dir.join("{_bootstrap["file"]}").exists();\n'
+            "            persist_load(&mut inner, dir);\n"
+            + _after
+            + "            if scale_first_launch && device_is_phone(&app) == Some(true) {\n"
+            f"                {_set}\n"
+            "                persist_save(&mut inner, dir);\n"
+            "            }\n"
+            "        }\n"
+            "        "
+        )
+    else:
+        _bootstrap_body = (
+            "let persist = persist_dir(&app);\n"
+            "        if let Some(dir) = &persist {\n"
+            "            persist_load(&mut inner, dir);\n"
+            + _after
+            + "        }\n"
+            "        "
+        )
+    persist_new_body = _bootstrap_body
     persist_new_init = ", persist, persist_last: None"
     persist_methods = PERSIST_METHODS
     persist_logic = "        self.persist_tick();\n"
@@ -1995,6 +2317,14 @@ else:
 # in a tiny struct that forwards `logic`/`ui`. Emit the same wrapper here.
 has_eframe_app = bool(re.search(r"impl\s+eframe::App\s+for\s+" + re.escape(app_type) + r"\b", ui_text))
 has_raw_hook = bool(re.search(r"pub fn raw_input_hook\b", ui_text))
+# A close guard: the app's own "may I close?" check. The desktop runs it when its window closes,
+# so a document with unsaved changes asks first ("Do you want to quit without saving unsaved
+# changes?"); the Android back button runs the very same check, so the app's own prompt appears
+# instead of the app vanishing with unsaved work. Only the apps that have one are asked.
+has_close_guard = bool(re.search(r"pub fn close_requested\b", ui_text))
+# The flag such an app sets once the user answered that prompt ("Don't save", or the save
+# finished). The desktop closes the window when it is set; on Android the activity finishes.
+has_quit_flag = bool(re.search(r"pub quit_requested\b", ui_text))
 if not re.search(r"\bServices\b|\bNoServices\b", construct) and "Services" not in ui_root and not spec:
     raise SystemExit(f"The UI crate does not visibly export Services; a custom adapter is required for {app}.")
 
@@ -2049,6 +2379,13 @@ try:
     # bare `Session::new()`: without the host's importer and exporter, every import and export fails
     # with "media import is not available in this build" / "export is not available in this build".
     host_dep = 'effectcraft-host = { path = "../../crates/host" }\n' if app == "effectcraft" else ''
+    # CADCraft keeps its file formats out of the engine on purpose (it stays I/O-agnostic): the
+    # host installs them as global hooks — the DXF/DWG/SVG reader and writer, the plotter and the
+    # entity codec AutoLISP's entget/entmake/entmod use. The desktop app does that (see
+    # apps/cadcraft/src/main.rs); the launcher did not, so the engine had no file formats at all and
+    # every open failed with "file formats are not available in this build". The launcher needs the
+    # `cadcraft-io` crate to install them.
+    io_dep = 'cadcraft-io = { path = "../../crates/io" }\n' if app == "cadcraft" else ''
     java_sources = 'java_sources = "java"\n' if saf else ''
     config_changes = "orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|smallestScreenSize|density|layoutDirection|uiMode|fontScale|locale"
     # Android open/share associations for the app's document types (the MAIN/LAUNCHER entry is always
@@ -2105,9 +2442,12 @@ egui = {{ workspace = true }}
 egui-winit = "0.36"
 log = {{ workspace = true }}
 jni = "0.22"
-{serde_dep}{rfd_dep}{cpal_dep}{host_dep}
+{serde_dep}{rfd_dep}{cpal_dep}{host_dep}{io_dep}
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = {{ version = "0.6", default-features = false, features = ["game-activity"] }}
+# Rust `log` records go to logcat (tag = the crate name). Without this every `log::error!`
+# in the launcher and the SAF bridge vanished silently on device.
+android_logger = "0.15"
 
 [package.metadata.android]
 package = "{package_name}"
@@ -2132,6 +2472,11 @@ max_sdk_version = 29
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+# The update checker asks GitHub for a newer release of the builder (see
+# templates/android/UpdateCheck.java). Without this the request fails and no update is offered.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
 
 [package.metadata.android.application]
 label = "{title}"
@@ -2188,6 +2533,33 @@ icon = "@mipmap/ic_launcher"
             inner_hook = "let _ = ctx;\n        self.inner.raw_input_hook(raw);"
         else:
             inner_hook = "let _ = (ctx, raw);"
+
+    # The Android back button asks the app before it leaves, so an app with unsaved work opens
+    # its own "quit without saving?" prompt instead of the app disappearing. The check is the
+    # desktop's own (`close_requested`), and the flag the app sets once the user answered it
+    # (`quit_requested`) ends the app. Apps without either close as they are.
+    if has_close_guard:
+        close_guard_code = (
+            "        if !self.inner.close_requested() {\n"
+            "            // The app asked the user first (it opened its own prompt) and will finish\n"
+            "            // the app itself once the user confirms.\n"
+            "            self.close_asked = true;\n"
+            "            return;\n"
+            "        }\n"
+        )
+    else:
+        close_guard_code = ""
+    if has_quit_flag:
+        quit_check = (
+            "        if !self.closing && self.inner.quit_requested {\n"
+            "            // The user confirmed the app's own prompt (\"Don't save\", or the save\n"
+            "            // finished): the app may go now.\n"
+            "            self.closing = true;\n"
+            "            finish_activity(&self.app);\n"
+            "        }\n"
+        )
+    else:
+        quit_check = ""
 
     app_upper = re.sub(r"[^A-Za-z0-9]", "_", app).upper()
     # The SAF marker tracks the generator version so a reader can tell which template produced a
@@ -2290,6 +2662,55 @@ fn apply_bar_appearance(app: &AndroidApp, light_theme: bool) {
             log::error!("Could not style the Android system bars: {error}");
         }
     }));
+}
+
+/// Finish the Activity, ending the app. The Activity's own `onDestroy` ends the process once it
+/// is finishing (see templates/android/SafActivity.java). Runs on the Java main thread, like the
+/// fullscreen and bar-appearance calls, because `Activity.finish()` must be called there.
+fn finish_activity(app: &AndroidApp) {
+    let app_clone = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
+        let jvm = unsafe { JavaVM::from_raw(app_clone.vm_as_ptr() as *mut _) };
+        let result = jvm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let activity_raw = app_clone.activity_as_ptr() as jni::sys::jobject;
+            // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it.
+            let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+            env.call_method(&*activity, jni_str!("finish"), jni_sig!("()V"), &[])?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            log::error!("Could not finish the activity: {error}");
+        }
+    }));
+}
+
+/// Ask the Activity whether this is a phone-class (small) screen, so the first launch can raise the
+/// app's UI scale to 150% for phones while tablets are left at their own sizing. Returns `None`
+/// when the answer cannot be read, in which case the caller leaves the UI scale alone.
+///
+/// The decision is Android's own form-factor test (`smallestScreenWidthDp < 600`, the `sw600dp`
+/// boundary): it is the shortest screen edge in dp, so it is stable across rotation, and it
+/// describes screen size rather than density. Called once, on the Java main thread, using the same
+/// activity-via-JNI pattern as the fullscreen and bar-appearance helpers above.
+fn device_is_phone(app: &AndroidApp) -> Option<bool> {
+    // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
+    let jvm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut _) };
+    let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
+    let result = jvm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it.
+        let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+        Ok(env
+            .call_method(&*activity, jni_str!("isPhoneDevice"), jni_sig!("()Z"), &[])?
+            .z()?)
+    });
+    match result {
+        Ok(is_phone) => Some(is_phone),
+        Err(error) => {
+            log::warn!("Could not determine the screen class: {error}");
+            None
+        }
+    }
 }
 
 /// Reconstruct egui's modifier state on Android.
@@ -2474,6 +2895,33 @@ fn android_clipboard_set(app: &AndroidApp, text: &str) {
 }
 '''.replace("MARKER_PLACEHOLDER", shell_marker)
 
+    # CADCraft's file-format hooks. The engine stays I/O-agnostic on purpose: the *host* installs
+    # them — the desktop app does (see apps/cadcraft/src/main.rs), and the launcher now does too.
+    # Without them the engine has no file formats at all, and every open fails with "file formats
+    # are not available in this build".
+    if app == "cadcraft":
+        platform += r'''
+/// CADCraft's file formats: the DXF/DWG/SVG reader and writer, the plotter, and the entity
+/// codec AutoLISP's `entget`/`entmake`/`entmod` use. The engine keeps its I/O out on purpose —
+/// the host installs these (the desktop app does, see apps/cadcraft/src/main.rs).
+fn install_cadcraft_io() {
+    __ENGINE__::cmd::file::set_io(__ENGINE__::cmd::file::IoHooks {
+        read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
+        write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
+        plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+    });
+    __ENGINE__::cmd::file::set_write_as(|d, name, o| {
+        cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary })
+            .map_err(|e| e.to_string())
+    });
+    // AutoLISP's entget, entmake and entmod see entities as DXF groups.
+    __ENGINE__::cmd::file::set_entity_codec(__ENGINE__::cmd::file::EntityCodec {
+        groups: cadcraft_io::entity_groups,
+        entity: cadcraft_io::entity_from_groups,
+    });
+}
+'''.replace("__ENGINE__", engine_ident)
+
     if saf:
         saf_fields = "\n    saf_bridge: saf::Bridge,\n    saf_state: std::sync::Arc<SafState>,\n    saf_inbox: SafInbox,"
         saf_new_params = ", saf_bridge: saf::Bridge, saf_state: std::sync::Arc<SafState>, saf_inbox: SafInbox"
@@ -2494,6 +2942,36 @@ fn android_clipboard_set(app: &AndroidApp, text: &str) {
     fn open_incoming(&mut self, path: &str) {{
         log::info!("Opening the file the system handed the app: {{path}}");
 {intent_body}    }}
+
+    /// Watch for files the system (or another app's drop) handed the app while it was idle.
+    ///
+    /// egui runs a frame only when something asks it to, so a file that arrives while the app
+    /// sits untouched would wait in the Activity's queue until the user happened to touch the
+    /// screen. The watcher asks the Activity how many files are waiting (without taking any of
+    /// them) and asks egui for a repaint when there is one, so the file opens on its own. The
+    /// file itself is still opened on the frame thread, in `poll_incoming_files`.
+    fn watch_incoming(&mut self, ctx: &egui::Context) {{
+        static WATCHER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if WATCHER.set(()).is_err() {{
+            return;
+        }}
+        let bridge = self.saf_bridge.clone_ref();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {{
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if !ALIVE.load(std::sync::atomic::Ordering::Relaxed) {{
+                break;
+            }}
+            match bridge.intent_pending() {{
+                Ok(pending) if pending > 0 => ctx.request_repaint(),
+                Ok(_) => {{}}
+                Err(error) => {{
+                    log::info!("Launcher does not report incoming files: {{error}}");
+                    break;
+                }}
+            }}
+        }});
+    }}
 
     /// Open any file the system handed the app (an intent it is registered for). Runs once per
     /// staged file and is a no-op afterwards; a launcher without the intent host stops the poll.
@@ -2518,7 +2996,7 @@ fn android_clipboard_set(app: &AndroidApp, text: &str) {
         }}
     }}
 '''
-            intent_logic = "        self.poll_incoming_files();\n"
+            intent_logic = "        self.watch_incoming(ctx);\n        self.poll_incoming_files();\n"
             intent_field = "\n    intent_warmup: i64,"
             intent_init = ", intent_warmup: 2"
         else:
@@ -2609,6 +3087,13 @@ impl InputProbe {{
 }}
 
 {persist_support}
+/// Cleared when the shell shuts down, so a background watcher stops talking to the Activity.
+///
+/// Android releases the Activity's Java object as soon as the native thread returns, so a
+/// watcher that kept asking it for files after that would call into a dead object. The flag is
+/// cleared when the shell is dropped, which happens before the native thread returns.
+static ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 struct AndroidShell {{
     inner: {app_type},
     app: AndroidApp,
@@ -2616,13 +3101,16 @@ struct AndroidShell {{
     modifiers: egui::Modifiers,
     fullscreen_applied: bool,
     probe: InputProbe,
-    bars_theme: Option<bool>,{saf_fields}{intent_field}{persist_fields}{staged_fields}
+    bars_theme: Option<bool>,
+    back_pending: bool,
+    closing: bool,
+    close_asked: bool,{saf_fields}{intent_field}{persist_fields}{staged_fields}
 }}
 
 impl AndroidShell {{
     fn new(mut inner: {app_type}, app: AndroidApp{saf_new_params}) -> Self {{
         {persist_new_body}let ime = ime_bridge::ime::ImeBridge::new(&app);
-        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(), bars_theme: None{saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
+        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(), bars_theme: None, back_pending: false, closing: false, close_asked: false{saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
     }}
 {saf_poll_method}{intent_method}{persist_methods}{staged_methods}
     /// Keep the system-bar icon contrast on the app's active theme: egui's light/dark choice is
@@ -2650,6 +3138,45 @@ impl AndroidShell {{
             self.fullscreen_applied = true;
             apply_immersive_fullscreen(&self.app);
         }}
+    }}
+
+    /// Map Android's system back button onto Escape.
+    ///
+    /// winit's Android backend consumes `KEYCODE_BACK` (it reports the key as handled), so the
+    /// framework's own back handling never runs and the button only reaches egui as
+    /// `Key::BrowserBack` — which almost no app listens for. Every app already treats Escape as
+    /// "close the dialog / cancel / go back", so the back press is re-labelled as Escape, giving
+    /// the button its usual meaning with no app change. The press is also remembered, so
+    /// [`AndroidShell::ui`] can finish the app when nothing consumed it (the normal Android
+    /// "back exits" behaviour).
+    fn map_android_back(&mut self, raw: &mut egui::RawInput) {{
+        let mut pressed = false;
+        for event in &mut raw.events {{
+            if let egui::Event::Key {{ key, pressed: is_pressed, .. }} = event
+                && *key == egui::Key::BrowserBack
+            {{
+                *key = egui::Key::Escape;
+                pressed |= *is_pressed;
+            }}
+        }}
+        if pressed {{
+            self.back_pending = true;
+            log::info!("Android: back press mapped to Escape");
+        }}
+    }}
+
+    /// The user asked to leave (the Android back button). Let the app have the first word: the
+    /// apps that guard against losing work ask first, and only a close they agree to ends the
+    /// app. `close_requested` is the desktop's own check — the desktop runs it when its window
+    /// closes — so the app opens the same "Do you want to quit without saving unsaved changes?"
+    /// prompt it shows on the desktop instead of vanishing with unsaved work.
+    fn request_close(&mut self) {{
+        if self.closing {{
+            return;
+        }}
+        log::info!("Android: the app asked to close");
+{close_guard_code}        self.closing = true;
+        finish_activity(&self.app);
     }}
 
     /// Emit egui `Copy`/`Cut`/`Paste` events for Ctrl/Cmd+C/X/V key presses.
@@ -2681,15 +3208,37 @@ impl AndroidShell {{
     }}
 }}
 
+impl Drop for AndroidShell {{
+    fn drop(&mut self) {{
+        // The Activity is about to go: stop the watcher before the native thread returns.
+        ALIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }}
+}}
+
 impl eframe::App for AndroidShell {{
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {{
 {intent_logic}{saf_logic_poll}{persist_logic}{staged_logic}        {inner_logic}
         self.sync_bar_appearance(ctx);
-    }}
+{quit_check}    }}
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {{
         system_fonts::install_system_fonts(ui.ctx());
         {inner_ui}
+        if self.back_pending {{
+            self.back_pending = false;
+            // A back press was mapped onto Escape. If the app consumed that Escape (a dialog
+            // closed, a panel went back), the button did its job; otherwise back means "leave",
+            // as it does on Android — which the app may still refuse, by asking first.
+            if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {{
+                if self.close_asked {{
+                    // The app had its say last time (it opened a prompt, which this press just
+                    // dismissed); don't ask it again straight away.
+                    self.close_asked = false;
+                }} else {{
+                    self.request_close();
+                }}
+            }}
+        }}
     }}
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {{
@@ -2697,6 +3246,7 @@ impl eframe::App for AndroidShell {{
         self.ime.poll(raw);
         self.refresh_fullscreen(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
+        self.map_android_back(raw);
         self.handle_clipboard_shortcuts(raw);
 {persist_hook}        {inner_hook}
     }}
@@ -2711,12 +3261,19 @@ impl eframe::App for AndroidShell {{
     # available from frame one.
     create_hook = {
         "figcraft": "            figcraft_ui_egui::theme::install_fonts(&cc.egui_ctx, false, 0);\n",
+        # CADCraft's file formats have to be in place before the app opens anything.
+        "cadcraft": "            install_cadcraft_io();\n",
     }.get(app, "")
-    creator = (
-        "Box::new(move |cc| {\n" + create_hook + "            Ok(Box::new(shell))\n        })"
-        if create_hook
-        else "Box::new(move |_cc| Ok(Box::new(shell)))"
-    )
+    if create_hook:
+        # The hook may or may not need the eframe creation context.
+        param = "cc" if "cc" in create_hook else "_cc"
+        creator = (
+            f"Box::new(move |{param}| {{\n"
+            + create_hook
+            + "            Ok(Box::new(shell))\n        })"
+        )
+    else:
+        creator = "Box::new(move |_cc| Ok(Box::new(shell)))"
 
     if saf:
         entry = f'''//! Generated Android launcher for {title}.
@@ -2727,6 +3284,17 @@ impl eframe::App for AndroidShell {{
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: android_activity::AndroidApp) {{
+    // A panic's backtrace, to see where the Vulkan surface is created.
+    #[allow(unused_unsafe)]
+    unsafe {{
+        {{std::env::set_var("RUST_BACKTRACE", "1");}}
+    }}
+    // Route Rust `log` records to logcat; without this a failed picker/save was invisible.
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("{package_name}"),
+    );
     log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}}, {{}})", saf::SAF_MARKER, ime_bridge::ime::IME_MARKER);
     apply_immersive_fullscreen(&android_app);
     egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
@@ -2788,6 +3356,17 @@ fn android_main(android_app: android_activity::AndroidApp) {{
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(android_app: android_activity::AndroidApp) {{
+    // A panic's backtrace, to see where the Vulkan surface is created.
+    #[allow(unused_unsafe)]
+    unsafe {{
+        {{std::env::set_var("RUST_BACKTRACE", "1");}}
+    }}
+    // Route Rust `log` records to logcat; without this a failed picker/save was invisible.
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("{package_name}"),
+    );
     log::info!("{{ARTCRAFT_ANDROID_SHELL_MARKER}} ready ({{}})", ime_bridge::ime::IME_MARKER);
     apply_immersive_fullscreen(&android_app);
     egui_winit::android_activity::set_activity(android_app.activity_as_ptr());
@@ -2874,7 +3453,37 @@ print("  Orientation: sensor (allows portrait and landscape rotation)")
 PY
 fi
 
+# The shared update checker (templates/android/UpdateCheck.java) is installed next to every
+# launcher's Activity, whichever path produced that launcher: the generated one and the
+# per-app adapters alike. It compares the builder version baked into the APK with the latest
+# GitHub release and offers the download when GitHub has a newer one.
+UPDATER_DIR="$ANDROID_DIR/java/com/artcraft/updater"
+if [[ -d "$ANDROID_DIR/java" ]]; then
+    mkdir -p "$UPDATER_DIR"
+    python3 - "$ROOT/templates/android/UpdateCheck.java" "$UPDATER_DIR/UpdateCheck.java" \
+        "$BUILDER_VERSION" "$UPDATE_API_URL" "$UPDATE_PAGE_URL" <<'PY'
+from pathlib import Path
+import sys
+
+source, target, version, api_url, page_url = sys.argv[1:6]
+text = Path(source).read_text()
+text = (
+    text.replace("__BUILDER_VERSION__", version)
+    .replace("__UPDATE_API_URL__", api_url)
+    .replace("__UPDATE_PAGE_URL__", page_url)
+)
+Path(target).write_text(text)
+PY
+    echo "  -> installed the update checker (builder version $BUILDER_VERSION)"
+fi
+
 [[ -f "$ANDROID_DIR/Cargo.toml" && -f "$ANDROID_DIR/src/lib.rs" ]] || fail "Android wrapper is incomplete at $ANDROID_DIR. See the build log and adapters/README.md."
+
+# The soft keyboard's return after the user dismissed it with the back key is applied by its
+# own script, so it can be turned off for testing by commenting out the line below. It patches
+# the generated launcher (the Activity, the shared IME bridge and the shell) at build time; only
+# the apps it names are touched.
+bash "$ROOT/lib/ime.sh" "$SRC" "$APP" "$TITLE"
 
 # egui-winit's stock Android build gates its `arboard` clipboard backend behind
 # `cfg(not(target_os = "android"))`, so on Android its `Clipboard` is only an in-app
@@ -2992,6 +3601,31 @@ if entry not in s:
     p.write_text(s)
 PY
 
+# egui-wgpu's lost-surface recovery kept the old surface alive while it created the new one: the
+# old `SurfaceState` owns the old `wgpu::Surface`, and it lived until the end of the function, so
+# the new surface was created for a window that still had the old one. Android's Vulkan refuses
+# that (ERROR_NATIVE_WINDOW_IN_USE_KHR) and wgpu panics on the error, so an app whose surface was
+# lost — the app coming back from a file picker, for instance — died with it. Vendor the builder's
+# patched egui-wgpu, which releases the old surface first, and patch it into the workspace.
+echo "Vendoring the surface-fixing egui-wgpu for $TITLE..."
+rm -rf "$SRC/vendor/egui-wgpu"
+cp -a "$ROOT/vendor/egui-wgpu" "$SRC/vendor/egui-wgpu"
+python3 - "$SRC/Cargo.toml" <<'PY'
+from pathlib import Path
+import sys, tomllib
+p = Path(sys.argv[1])
+s = p.read_text()
+entry = 'egui-wgpu = { path = "vendor/egui-wgpu" }'
+import re
+s = re.sub(r'^\s*egui-wgpu\s*=\s*\{.*?\}\s*(?:#.*)?\n?', '', s, flags=re.M)
+if entry not in s:
+    header = "[patch.crates-io]"
+    s = (s.replace(header, header + "\n" + entry, 1) if header in s
+         else s.rstrip() + "\n\n" + header + "\n" + entry + "\n")
+    tomllib.loads(s)
+    p.write_text(s)
+PY
+
 # Every launcher uses the builder's vendored android-activity: the game-activity backend now
 # carries three builder patches the crates.io copy lacks. (1) The sync-picker ANR fix: while a
 # blocking pick parks the Rust main thread, the JVM-thread lifecycle, save-state and window
@@ -3096,10 +3730,34 @@ else:
 PY
 )"
 
-# FigCraft and DeckCraft set `CRAFT_FONTS_DIR = "../craft-fonts"` (relative) in .cargo/config.toml.
-# Keep the (empty) directory present so the path resolves in every app's build script; the fonts
-# are optional and a missing directory makes those scripts warn and use system fonts.
-mkdir -p "$ROOT/source/craft-fonts"
+# The shared craft-fonts (https://github.com/storytold/craft-fonts) are an optional build input
+# for the apps that embed them (WordCraft, PdfCraft): with `CRAFT_FONTS_DIR` pointing at a
+# checkout, their fonts crate embeds the faces listed in that checkout's `fonts/manifest.txt`.
+#
+# Without it they build with no face of their own for a script the device may not have, and the
+# PDF text writer then refuses the text instead of writing it: "The PDF text fonts can't draw
+# “ا” (U+0627)" — which is what the Android build did, because it only made an empty directory
+# where the fonts were expected.
+#
+# The checkout is kept, like the apps' own sources, so a local pin is not overwritten; a checkout
+# that is there but has no `fonts/` directory is left alone and the apps build without the faces.
+CRAFT_FONTS_DIR="$ROOT/source/craft-fonts"
+if [[ -f "$CRAFT_FONTS_DIR/fonts/manifest.txt" ]]; then
+    echo "Reusing the craft-fonts checkout in $CRAFT_FONTS_DIR"
+elif [[ -e "$CRAFT_FONTS_DIR" ]]; then
+    echo "The craft-fonts checkout at $CRAFT_FONTS_DIR has no fonts/manifest.txt; leaving it alone." >&2
+else
+    echo "Fetching craft-fonts (the shared faces the apps embed)..."
+    git clone --depth 1 https://github.com/storytold/craft-fonts.git "$CRAFT_FONTS_DIR" || {
+        echo "Could not fetch craft-fonts; the apps will build without the shared faces." >&2
+    }
+fi
+if [[ -f "$CRAFT_FONTS_DIR/fonts/manifest.txt" ]]; then
+    # The apps' build scripts read the faces from the checkout and embed them; the variable is
+    # absolute, so it does not matter where the build runs from.
+    export CRAFT_FONTS_DIR
+    echo "  -> embedding the craft-fonts faces ($(grep -cve '^#' -e '^$' "$CRAFT_FONTS_DIR/fonts/manifest.txt") of them)"
+fi
 
 # The Gradle project, AndroidManifest.xml and theme resource are regenerated from the launcher's
 # Cargo metadata on every build (see lib/android_project.py).

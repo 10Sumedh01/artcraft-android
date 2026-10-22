@@ -135,7 +135,7 @@ impl WinitState {
             Err(e) => {
                 tracing::warn!("Subcompositor protocol not available, ignoring CSD: {e:?}");
                 None
-            },
+            }
         };
 
         let output_state = OutputState::new(globals, queue_handle);
@@ -218,7 +218,8 @@ impl WinitState {
             {
                 pos
             } else {
-                self.window_compositor_updates.push(WindowCompositorUpdate::new(window_id));
+                self.window_compositor_updates
+                    .push(WindowCompositorUpdate::new(window_id));
                 self.window_compositor_updates.len() - 1
             };
 
@@ -239,7 +240,9 @@ impl WinitState {
     }
 
     pub fn queue_close(updates: &mut Vec<WindowCompositorUpdate>, window_id: WindowId) {
-        let pos = if let Some(pos) = updates.iter().position(|update| update.window_id == window_id)
+        let pos = if let Some(pos) = updates
+            .iter()
+            .position(|update| update.window_id == window_id)
         {
             pos
         } else {
@@ -273,12 +276,15 @@ impl WindowHandler for WinitState {
     ) {
         let window_id = super::make_wid(window.wl_surface());
 
-        let pos = if let Some(pos) =
-            self.window_compositor_updates.iter().position(|update| update.window_id == window_id)
+        let pos = if let Some(pos) = self
+            .window_compositor_updates
+            .iter()
+            .position(|update| update.window_id == window_id)
         {
             pos
         } else {
-            self.window_compositor_updates.push(WindowCompositorUpdate::new(window_id));
+            self.window_compositor_updates
+                .push(WindowCompositorUpdate::new(window_id));
             self.window_compositor_updates.len() - 1
         };
 
@@ -312,7 +318,10 @@ impl OutputHandler for WinitState {
     }
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-        self.monitors.lock().unwrap().push(MonitorHandle::new(output));
+        self.monitors
+            .lock()
+            .unwrap()
+            .push(MonitorHandle::new(output));
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, updated: WlOutput) {
@@ -422,7 +431,12 @@ pub struct WindowCompositorUpdate {
 
 impl WindowCompositorUpdate {
     fn new(window_id: WindowId) -> Self {
-        Self { window_id, resized: false, scale_changed: false, close_window: false }
+        Self {
+            window_id,
+            resized: false,
+            scale_changed: false,
+            close_window: false,
+        }
     }
 }
 

@@ -1,18 +1,24 @@
 package com.artcraft.vectorcraft;
 
+import android.Manifest;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.OpenableColumns;
+import android.provider.Settings;
 import android.text.InputType;
 import android.util.Log;
+import android.view.DragEvent;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -59,6 +65,7 @@ public final class VectorCraftActivity extends GameActivity {
     private static final String TAG = "VectorCraftSAF";
     private static final int REQ_OPEN = 0x5643;
     private static final int REQ_SAVE = 0x5644;
+    private static final int REQ_PERMISSIONS = 0x5645;
     private static final String PREFS = "vectorcraft_saf_uri_map";
 
     private final ConcurrentLinkedQueue<String> results = new ConcurrentLinkedQueue<>();
@@ -81,9 +88,66 @@ public final class VectorCraftActivity extends GameActivity {
     // intentPoll() and opened exactly like a file chosen in the picker.
     private final ConcurrentLinkedQueue<String> intentPaths = new ConcurrentLinkedQueue<>();
 
+    // Desktop-style drag and drop: dragging a file out of the Files app (or a browser) onto this
+    // window in split-screen lands it in the same intentPaths queue as a shared file, so the Rust
+    // shell opens it through the unchanged intentPoll() path - one document per drop, pictures
+    // landing on the open page wherever the app's inbox inserts them.
+    private final View.OnDragListener dropListener = new View.OnDragListener() {
+        @Override
+        public boolean onDrag(View view, DragEvent event) {
+            try {
+                switch (event.getAction()) {
+                    case DragEvent.ACTION_DRAG_STARTED:
+                        // Accept only drags that actually carry files; returning false here keeps
+                        // text/other drags free for whatever else wants them.
+                        return !collectDragUris(event.getClipData()).isEmpty();
+                    case DragEvent.ACTION_DRAG_ENTERED:
+                    case DragEvent.ACTION_DRAG_LOCATION:
+                    case DragEvent.ACTION_DRAG_EXITED:
+                        // Take the enter as well: the framework keeps a drag with the view that
+                        // accepted the enter and hands the drop to that same view, so declining
+                        // the enter here would swallow the drop before it arrives.
+                        return true;
+                    case DragEvent.ACTION_DROP: {
+                        List<Uri> uris = collectDragUris(event.getClipData());
+                        if (uris.isEmpty()) return false;
+                        // The drag grant is temporary; keep it if the source offered a persistable
+                        // one, then copy on the I/O thread while the drop access still holds.
+                        for (Uri uri : uris) persistDroppedPermission(uri);
+                        stageDroppedFiles(uris);
+                        return true;
+                    }
+                    default:
+                        // ENDED (the drag ended) and anything else: nothing to do.
+                        return false;
+                }
+            } catch (Throwable error) {
+                Log.e(TAG, "Could not handle a dragged file", error);
+                return false;
+            }
+        }
+    };
+
     /** App-private storage root, used by the Rust shell for preferences and scratch data. */
     public String vcFilesDir() {
         return appStorageDir().getAbsolutePath();
+    }
+
+    /**
+     * True when the device is a phone-class (small) screen, so the first launch can raise the app's
+     * UI scale to a comfortable 150% for it. This is Android's own form-factor test:
+     * {@code smallestScreenWidthDp} is the *shortest* screen edge in density-independent pixels (so
+     * it does not flip with rotation), and 600dp is the same {@code sw600dp} boundary the platform
+     * and Play Store use to bucket tablets. Density ("dpi") is deliberately not used — it describes
+     * pixel size, not screen size. Called once by the Rust shell over JNI.
+     */
+    public boolean isPhoneDevice() {
+        try {
+            return getResources().getConfiguration().smallestScreenWidthDp < 600;
+        } catch (Throwable error) {
+            Log.w(TAG, "Could not read the screen size; assuming a phone", error);
+            return true;
+        }
     }
 
     /**
@@ -105,6 +169,44 @@ public final class VectorCraftActivity extends GameActivity {
      * after a gesture or when the SAF picker activity closes. {@code onWindowFocusChanged} re-applies
      * it when focus returns.
      */
+    /**
+     * Ask once, on first launch, for broad file access so the app can read and write the device's
+     * own storage — the files the user opens or exports directly, and the font folders the builder
+     * links for the shell (the device's own faces and the user's {@code Fonts} folder). Android
+     * 11+ grants it through the "All files access" settings screen; older versions request it at
+     * runtime. The ask is remembered so a refusal never nags; the grant can be changed later in
+     * Settings.
+     */
+    /**
+     * Ask the user for broad device file access ("All files access"), so the app's own file
+     * browsers can read and write files beyond the ones picked through SAF, and the font
+     * folders the shell links are readable.
+     *
+     * The ask is repeated on every launch until the user grants it: the permission is what the
+     * app needs to work with the device's storage, and a dismissal is not an answer that lasts.
+     * Once it is granted, nothing is asked any more.
+     */
+    private void requestStoragePermission() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (Environment.isExternalStorageManager()) return;
+                Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                intent.setData(Uri.parse("package:" + getPackageName()));
+                startActivity(intent);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) return;
+                requestPermissions(
+                        new String[] {
+                            Manifest.permission.READ_EXTERNAL_STORAGE,
+                            Manifest.permission.WRITE_EXTERNAL_STORAGE
+                        },
+                        REQ_PERMISSIONS);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Could not request file access", e);
+        }
+    }
+
     private void applyImmersiveFullscreen() {
         Window window = getWindow();
         if (window == null) {
@@ -138,8 +240,16 @@ public final class VectorCraftActivity extends GameActivity {
         if (window != null) {
             window.getDecorView().post(this::applyImmersiveFullscreen);
         }
+        installDropTarget();
+        // Once, on the first launch: the settings screen that grants the app access to the device's
+        // storage (the font folders the shell links included). Answered later, outside the app, so
+        // the links the shell makes at startup are refreshed when the access arrives.
+        requestStoragePermission();
         imeSetup();
         handleIncomingFiles(getIntent());
+        // Ask GitHub whether a newer builder release exists (a few seconds in, off the main
+        // thread). The shared checker is installed next to this Activity by the builder.
+        com.artcraft.updater.UpdateCheck.start(this);
     }
 
     @Override
@@ -376,6 +486,100 @@ public final class VectorCraftActivity extends GameActivity {
      */
     public String intentPoll() {
         return intentPaths.poll();
+    }
+
+    /**
+     * How many files the system (or another app's drop) handed us that the shell has not opened
+     * yet. Asked without taking anything off the queue, so the frame that opens the file still
+     * finds it there. The shell's watcher thread uses it to wake an idle app: egui runs a frame
+     * only when something asks it to, so a file that arrives while the app sits untouched would
+     * otherwise wait in the queue until the user happened to touch the screen.
+     */
+    public int intentPending() {
+        return intentPaths.size();
+    }
+
+    /** Every {@code content://} URI the drag carries (text-only drags yield nothing). */
+    private List<Uri> collectDragUris(ClipData clip) {
+        List<Uri> uris = new ArrayList<>();
+        if (clip == null) return uris;
+        for (int i = 0; i < clip.getItemCount(); i++) {
+            Uri uri = clip.getItemAt(i).getUri();
+            if (uri != null) uris.add(uri);
+        }
+        return uris;
+    }
+
+    /**
+     * Best-effort persistable grant for a dropped URI. Drag-and-drop only grants temporary
+     * access, so a source that offered a persistable grant (the system file picker does) keeps
+     * the copy below readable even after the drag ends; the rest are copied while the drop's
+     * temporary grant still holds. Write access is asked for first, because a dropped document
+     * is saved back to the place it came from (the staged copy remembers the source URI), and a
+     * provider that only offered read access still gets the read grant.
+     */
+    private void persistDroppedPermission(Uri uri) {
+        Exception failure = null;
+        int[] grants = {
+                Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+        };
+        for (int flags : grants) {
+            try {
+                getContentResolver().takePersistableUriPermission(uri, flags);
+                return;
+            } catch (Exception e) {
+                failure = e;
+            }
+        }
+        Log.i(TAG, "Provider did not offer a persistable grant for " + uri, failure);
+    }
+
+    /**
+     * Copy dropped files into app-private staging and queue their paths for the Rust shell,
+     * mirroring the shared-file path: the copy runs off the UI thread and the shell picks each
+     * path up on a later {@link #intentPoll()}.
+     */
+    private void stageDroppedFiles(List<Uri> uris) {
+        io.execute(() -> {
+            for (Uri uri : uris) {
+                try {
+                    File stage = newStageFile(displayName(uri), uri);
+                    copyUriToFile(uri, stage);
+                    rememberUri(stage, uri);
+                    intentPaths.offer(stage.getAbsolutePath());
+                    Log.i(TAG, "Dropped file staged: " + stage.getAbsolutePath());
+                } catch (Exception e) {
+                    Log.e(TAG, "Could not stage the dropped file: " + uri, e);
+                }
+            }
+        });
+    }
+
+    /**
+     * Listen for drags on the whole window: the decor, the content frame and every child of it
+     * (the native surface and the keyboard host), so the drop is caught whichever view the
+     * system considers to be under the pointer. Views that don't handle a drag pass it on, so
+     * the same listener on all of them never conflicts.
+     */
+    private void installDropTarget() {
+        try {
+            Window window = getWindow();
+            if (window == null) return;
+            View decor = window.getDecorView();
+            decor.setOnDragListener(dropListener);
+            View content = decor.findViewById(android.R.id.content);
+            if (content == null) return;
+            content.setOnDragListener(dropListener);
+            if (content instanceof ViewGroup) {
+                ViewGroup group = (ViewGroup) content;
+                for (int i = 0; i < group.getChildCount(); i++) {
+                    group.getChildAt(i).setOnDragListener(dropListener);
+                }
+            }
+        } catch (Throwable error) {
+            Log.e(TAG, "Could not install the drag-and-drop target", error);
+        }
     }
 
     /** One queued picker result as JSON, or null; polled by the Rust shell every frame. */

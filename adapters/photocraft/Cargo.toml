@@ -22,6 +22,8 @@ jni = "0.22"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
+# Rust `log` records to logcat; without this launcher/bridge errors were silent on device.
+android_logger = "0.15"
 
 [package.metadata.android]
 package = "com.artcraft.photocraft"
@@ -33,6 +35,26 @@ java_sources = "java"
 [package.metadata.android.sdk]
 min_sdk_version = 28
 target_sdk_version = 35
+
+# Let the app's own file builders read and write files on the device (see
+# PhotoCraftActivity: requestStoragePermission). Legacy permissions cover
+# Android 12 and older; "All files access" covers Android 11+ and the font folders the
+# shell links for the app (the device's own faces and the user's own Fonts folder).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+max_sdk_version = 29
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+# The update checker asks GitHub for a newer release of the builder (see
+# templates/android/UpdateCheck.java). Without this the request fails and no update is offered.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
 
 [package.metadata.android.application]
 label = "PhotoCraft"

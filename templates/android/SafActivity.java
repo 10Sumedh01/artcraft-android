@@ -149,20 +149,25 @@ public final class __CLASS__ extends GameActivity {
      * through the "All files access" settings screen; older versions request it at runtime. The
      * ask is remembered so a refusal never nags; the grant can be changed later in Settings.
      */
+    /**
+     * Ask the user for broad device file access ("All files access"), so the app's own file
+     * browsers can read and write files beyond the ones picked through SAF, and the font
+     * folders the shell links are readable.
+     *
+     * The ask is repeated on every launch until the user grants it: the permission is what the
+     * app needs to work with the device's storage, and a dismissal is not an answer that lasts.
+     * Once it is granted, nothing is asked any more.
+     */
     public void safRequestStoragePermission() {
         runOnUiThread(() -> {
             try {
-                SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-                if (prefs.getBoolean("storage_asked", false)) return;
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     if (Environment.isExternalStorageManager()) return;
-                    prefs.edit().putBoolean("storage_asked", true).apply();
                     Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
                     intent.setData(Uri.parse("package:" + getPackageName()));
                     startActivity(intent);
                 } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) return;
-                    prefs.edit().putBoolean("storage_asked", true).apply();
                     requestPermissions(
                             new String[] {
                                 Manifest.permission.READ_EXTERNAL_STORAGE,
@@ -234,6 +239,39 @@ public final class __CLASS__ extends GameActivity {
             window.setNavigationBarColor(0x00000000);
         } catch (Throwable error) {
             Log.i(TAG, "This device does not accept transparent system bars", error);
+        }
+    }
+
+    /**
+     * Keep the interface below the window's own title bar.
+     *
+     * A desktop window (Samsung DeX and the other freeform modes) carries a title bar of its
+     * own, which the system draws over the top of the window. Its inset is a *consuming* one:
+     * the system hands it to the app instead of applying it to the content, so edge to edge the
+     * top of the interface is drawn under the title bar and is cut off. The content view is
+     * padded by the title bar's height, which moves the native surface (and the interface on it)
+     * with it.
+     *
+     * The insets are only known once the window has been laid out, so this is applied again when
+     * the window takes focus.
+     */
+    private void applyCaptionBarPadding() {
+        try {
+            View decor = getWindow() != null ? getWindow().getDecorView() : null;
+            View content = decor != null ? decor.findViewById(android.R.id.content) : null;
+            if (content == null) {
+                return;
+            }
+            int top = 0;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.view.WindowInsets root = decor.getRootWindowInsets();
+                if (root != null) {
+                    top = root.getInsets(WindowInsets.Type.captionBar()).top;
+                }
+            }
+            content.setPadding(0, top, 0, 0);
+        } catch (Throwable error) {
+            Log.i(TAG, "Could not inset the interface below the window's title bar", error);
         }
     }
 
@@ -350,6 +388,11 @@ public final class __CLASS__ extends GameActivity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
+            // Repeated now that the window has been laid out: only then are its insets known,
+            // and with them the title bar of a desktop window, which the interface has to stay
+            // below.
+            applyEdgeToEdge();
+            applyCaptionBarPadding();
             applyImmersiveFullscreen();
         }
     }

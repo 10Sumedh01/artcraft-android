@@ -416,8 +416,16 @@ static void android_app_free(struct android_app* android_app) {
     // freeing the android_app
 
     android_app_write_cmd(android_app, APP_CMD_DESTROY);
-    while (!android_app->destroyed) {
-        pthread_cond_wait(&android_app->cond, &android_app->mutex);
+    // Bounded like the other lifecycle waits, and skipped outright while the Rust thread may
+    // be parked in a blocking pick: the activity is torn down when the picker lands on top of
+    // it, and waiting here for the parked thread to set `destroyed` would block the Java main
+    // thread until Android kills the whole process -- which is exactly what produced a
+    // 0-byte save destination whenever the picker opened. The command is still written, so a
+    // thread that later reads the pipe applies the destroy in order.
+    if (!ARTCRAFT_NONBLOCKING_CALLBACKS) {
+        while (!android_app->destroyed) {
+            pthread_cond_wait(&android_app->cond, &android_app->mutex);
+        }
     }
     pthread_mutex_unlock(&android_app->mutex);
 

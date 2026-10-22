@@ -2,6 +2,242 @@
 
 ## v37 — 2026-10-20
 
+### Fixed
+- A hardware trackpad's two-finger scroll did nothing at all. The backend told a mouse, a touchpad
+  and a trackball apart by matching the device's whole source against one constant, but Android
+  describes a device by a *bitmask*: a touchpad is `SOURCE_MOUSE | SOURCE_TOUCHPAD` (0x0010200a),
+  which matches no constant, so the touchpad was taken for a finger on the glass and its scroll
+  dragged the document around instead of scrolling it. The source is now read bit by bit (with the
+  tool as the second hint, as Android's own documentation prescribes: a touchpad's events normally
+  report only `SOURCE_MOUSE`, and `TOOL_TYPE_FINGER` is what tells it apart from a mouse). The
+  touchpad's gesture is also read from the right place: Android reports it as a classified motion
+  event whose pointer walks across the screen as the gesture goes on, and the distance it walked is
+  the scroll — the same pixels, in the same direction, as a two-finger drag on the glass. A
+  two-finger pinch is reported as a zoom, the way a browser reports it. The classification is a
+  separate, tested function (`vendor/winit/src/platform_impl/android/device_kind.rs`, with a host
+  test in `tests/android_device_kind.rs`).
+- A desktop window (Samsung DeX and the other freeform modes) cut the top off the interface. A
+  desktop window carries a title bar of its own, which the system draws over the top of the window,
+  and its inset is a *consuming* one: the system hands it to the app instead of applying it to the
+  content, so edge to edge the app's interface was drawn under that title bar and the first row of
+  it was hidden behind it. The content view is now padded by the title bar's height, which moves
+  the native surface (and the interface on it) below it. The padding is applied again when the
+  window takes focus, because only then are the insets known.
+- The two-finger pan scrolled the document the wrong way round. The content follows the fingers, but
+  the backend reported the movement of the two fingers' midpoint with the opposite sign, so a slide
+  up moved the document down.
+- A mouse's wheel and a trackpad's scroll were told apart by the size of the amount instead of by
+  the device. Android normalises a mouse's wheel to ±1 per notch and reports it on the scroll axes;
+  a touchpad reports the same axes continuously, and only the device says which it is (the
+  touchpad's own source, or a mouse whose tool is a finger). The size-based guess made a trackpad's
+  scroll change speed the moment its amount grew past the threshold, and sent a mouse's notches
+  down the smooth path now and then, where they fed the momentum and the page coasted on after the
+  wheel had stopped — a scroll that felt like it happened twice. A mouse's notches are line deltas
+  (one notch, one step, no coast) and a trackpad's are pixel deltas (smooth, and they coast).
+- Save As and Export in WordCraft aborted the app the moment the system picker appeared. The
+  picker was run on the frame thread, and that thread *is* the event-loop pump: while it was
+  parked the app never received Android's `Suspended` lifecycle event, so the renderer never tore
+  down its wgpu/Vulkan surface. On resume Android hands the app a new `ANativeWindow`, and creating
+  a surface for a window that still had a live `VkSurfaceKHR` aborts the process with
+  `AndroidSurface failed: ERROR_NATIVE_WINDOW_IN_USE_KHR` (confirmed in logcat; it killed the app
+  on every save and export). WordCraft has an asynchronous dialog API for exactly this
+  (`Services::file_dialog`, `#94`/`#511`), so the launcher now shows every dialog — Open,
+  Insert/Change Picture, Add Font, recipients, Save As, Export, Print-to-PDF — through it on a
+  worker thread while the frame loop keeps pumping; the app picks the answer up on a later frame.
+  A new `saf::Bridge::pick_blocking_worker` waits on the worker without the frame-thread
+  `NonblockingCallbacks` (the frame thread is alive now, so the glue's lifecycle callbacks complete
+  on their own and input stays with winit's own iterator).
+- WordCraft's Export opened the save dialog **twice**, and the first destination stayed a 0-byte
+  file. The launcher set `Services::download`, the *browser's* save mechanism: with it set,
+  `file.saveAs`/`file.exportPdf`/`file.exportPng` ignore the picked path and ask a second dialog
+  for the bytes, while the first picker had already been opened for a path. Android saves like the
+  desktop — the engine writes the picked path and `SaveMirror` commits that staged file to the
+  chosen SAF document — so `download` (and `open_async`, which competed for the same answer queue)
+  are no longer set, leaving exactly one dialog per action.
+- A file handed to a **running** app was not opened until the user touched the screen. The system
+  hands an opened file to the app as an intent; the Activity stages it and queues its private
+  path, and the Rust shell drains that queue from `eframe::App::logic` — but egui runs a frame
+  only when something asks it to, so an app sitting untouched never ran the frame that would
+  have opened the file. The file appeared in the app's Recent list only after the next touch
+  (the intent's own copy is queued, not lost), and the editor stayed on the previous document.
+  The launcher now watches for it: a background thread asks the Activity how many files are
+  waiting — a new `intentPending()` that counts the queue without taking anything off it — and
+  asks egui for a repaint when there is one, so the file opens on its own. The file itself is
+  still opened on the frame thread, in the same place as before. The watcher stops when the app
+  shuts down, before Android releases the Activity's Java object, so it can never call into a
+  dead Activity.
+- Drag and drop now works in the PhotoCraft and VectorCraft adapters as well. The two custom
+  adapters carry their own Activity, so the drop support that the generated launchers got (a
+  window-wide `OnDragListener`, the staged copy, the persistable read/write grant) was missing
+  there: a file dragged onto those apps was ignored. Both adapters now have the same drop path,
+  and a dropped file lands in the same queue as a shared one, so it opens the same way.
+- The drop listener now takes the drag's *enter* as well as its drop. The framework keeps a
+  drag with the view that accepted the enter and hands the drop to that same view, so
+  declining the enter swallowed the drop before it arrived — the file was never staged. The
+  listener also asks for a persistable **write** grant first and falls back to a read grant:
+  a dropped document is saved back to the place it came from, and the staged copy remembers
+  the source URI, so a source that offered write access should get it.
+- The PhotoCraft and VectorCraft adapters could not read the device's storage at all. Every other
+  app declares `READ`/`WRITE_EXTERNAL_STORAGE` and "All files access" and asks for it once on the
+  first launch; the two custom adapters declared none of it and never asked, so anything outside
+  the app's own directories — the shared storage the file browsers work in, and the font folders
+  the shell links — was unreadable there. They now carry the same permissions and the same
+  one-time ask.
+- On an app installed before this version, no font at all could be linked into the folders the
+  apps' scanners read. That build linked each of those folders as a whole (`.fonts` →
+  `/system/fonts`), and the leftover still reads as an existing folder, so it was kept — while
+  every link made *inside* it failed silently with `EROFS`, its entries living on the read-only
+  system partition, and no user font could ever show up there. The leftover is now recognised and
+  replaced with the real folder of links on the first start. (The folder configuration the
+  fontconfig readers get is rewritten on every start for the same reason: the list of folders
+  grows — the user's own was added with this version — and a stale file would hide it from them.)
+- The soft keyboard never came back after the back key had dismissed it. Android takes the back
+  key as "hide the keyboard" and tells the app nothing, so the app kept believing the keyboard was
+  up, and the next edit — a tap in the text, a caret moved by key — went unseen by the keyboard,
+  which stayed down until the app was restarted. The Activity now watches the keyboard's own
+  window insets and knows when it was dismissed; the shell reports every edit it sees, and the
+  keyboard returns with it. The back key still hides the keyboard, and it stays hidden until the
+  document is worked on again.
+- The build could stop without saying why. A command that failed on its own — rather than one the
+  script handled with `|| true`, an `if` or a `case` — ended the run with nothing but the last
+  progress line in the log. The failing line is now named, so the log always says what went wrong.
+- A build whose source checkout was incomplete failed with a message that pointed at the wrong
+  thing. `git clone` can be interrupted — a killed build, or a full disk — after it has written
+  the commit and the origin but before it has written the whole tree; Git then reports a perfectly
+  normal origin and commit while most of the crates are missing from disk. The builder reused that
+  checkout as if it were sound, and the run ended with "this app needs an app-specific adapter
+  under adapters/<app>/", which is not what had happened. The checkout is now verified before it is
+  reused, an incomplete one is named as such and re-cloned, and the clone itself goes into a
+  scratch directory that is only moved into place once the tree has been checked — so an
+  interrupted clone can never become the checkout a later build reuses. A clone that runs out of
+  disk is now reported as such before it starts, and the space it needs is freed by name.
+
+### Added
+- The fonts in the user's own `Fonts` folder, treated like the device's own. `/storage/emulated/0/Fonts`
+  (and `/sdcard/Fonts`, and a subfolder of either) is already where a user can drop faces; its files
+  are now linked next to the system faces in the folder the apps' font scanners read and listed in
+  the font configuration, so WordCraft, GridCraft, DeckCraft, DesignCraft, VectorCraft, PdfCraft,
+  FigCraft, PhotoCraft and EffectCraft find them the way they find an installed one. The scanner
+  folders are one real folder holding a link per file, with the other names
+  (`$HOME/.local/share/fonts`, `$XDG_DATA_HOME/fonts`) linked *to* it: only a per-file folder can
+  carry the device's faces and the user's together, and every name resolving to one folder is what
+  keeps a scanner that reads two of them from listing every family twice. The links are kept
+  current while the app runs — the folder is looked at every couple of seconds and re-linked only
+  when something changed — so a font added later, or the "all files access" being granted after the
+  app started (which is how the ask plays out: the launcher opens the settings screen, and the user
+  answers while the app is already running), takes effect without relaunching. The shell logs what
+  it found (`Android: user fonts: N file(s) …`), and says so in plain words when the folder cannot
+  be read, since that is the one reason a font dropped there does not show up.
+
+### Changed
+- The apps ask for "All files access" again on every launch until it is granted. The ask used to
+  happen once, and a dismissal was remembered as an answer that lasted, so an app installed before
+  the ask existed never asked at all and could not read the device's storage. The permission is
+  what the apps need for the shared storage (the font folders the shell links, the files they open
+  and save), so the ask is repeated while it is missing and stops for good once it is granted.
+- WordCraft, GridCraft and DeckCraft now start on their own homepage instead of an empty document.
+  WordCraft shows Word's File › Home start screen (Blank document, the templates and Recent) and
+  previously opened "The Open Studio Handbook", the sample document, which looked like it had
+  loaded someone else's file; GridCraft and DeckCraft open the File tab's Backstage Home the way
+  their desktop apps do. The generated launcher reaches each app's own public entry point right
+  after the settings load — `WordApp::start_screen()` for WordCraft (its launch-with-no-document
+  path, `#766`/`#1129`) and `open_backstage(Page::Home)` for the other two — so nothing the loader
+  applied can overwrite it. In WordCraft, Esc or the back arrow then leaves an empty window and a
+  document is opened only when the user picks Blank document, a template, or a file.
+
+### Added
+- Rust logging is installed on Android. The launchers (and the PhotoCraft/VectorCraft adapters)
+  never called `android_logger::init_once`, so every `log::error!`/`log::info!` from the app, winit
+  and eframe — including eframe's fatal `Exiting because of error: …` — vanished on device and only
+  the hardest crashes (a raw panic) were visible. Now the whole log stream lands in logcat under the
+  app's own tag.
+- First-launch UI scaling for small screens. On a phone-class screen the desktop-sized interface is
+  uncomfortably small, so the **first** launch of each app now raises its UI scale to 150 %. The
+  decision uses Android's own form-factor test — `smallestScreenWidthDp < 600`, the same `sw600dp`
+  boundary the platform and Play Store use to bucket tablets — exposed by a new
+  `isPhoneDevice()` Activity method and read once over JNI (`device_is_phone`). It is the *shortest*
+  screen edge in density-independent pixels, so it is stable across rotation, and it describes
+  screen size rather than density (dpi): a large low-density tablet is not misread as a phone. Each
+  app's scale key and representation differ (int percent, choice string, `f32` factor,
+  `InterfaceSize` percentage), so the bootstrap is spelled out per app in
+  `UI_SCALE_BOOTSTRAP` (`lib/build-common.sh`) and in the PhotoCraft/VectorCraft adapters. It runs
+  only while the app's own settings file is absent, so a user who changes the scale later keeps
+  their choice; tablets, and every later launch, are left exactly as the user set them. Covered:
+  photocraft, vectorcraft, effectcraft, filmcraft, wordcraft, designcraft, deckcraft, soundcraft,
+  gridcraft, pdfcraft. LightCraft, FigCraft and CadCraft persist no interface scale and are
+  untouched. `GENERATOR_VERSION` 32 → 33 regenerates every launcher (35 for the file-dialog and
+  blank-document changes above).
+- The last unbounded lifecycle wait in the vendored `android_app_glue` is now bounded like the other
+  three: `android_app_free`'s wait for `android_app->destroyed` (`ARTCRAFT_NONBLOCKING_CALLBACKS`)
+  could stall the Java main thread during a pick. It still records `APP_CMD_DESTROY`; only the wait
+  is skipped.
+- Two-finger scrolling on touch screens, rebuilt the way a browser does it. A phone or tablet has no
+  wheel, so a two-finger drag is the only way to scroll, and the gesture has to be *recognised* the
+  way Chromium recognises a trackpad's: a two-finger slide scrolls, a two-finger pinch zooms. The
+  vendored winit backend decides the gesture once, inside a deadzone, and sticks to it: a slide that
+  moves the fingers' midpoint further than 12 physical pixels scrolls, a gesture that changes the
+  distance between the fingers further than 36 pixels (and much further than it moves the midpoint)
+  zooms, and anything in between does nothing at all — that deadzone is what keeps a scroll from
+  turning into a slow zoom halfway through. The gesture is then reported the way a platform reports
+  a trackpad's: the slide as continuous pixel deltas, applied 1:1 in physical pixels and 1.5× faster
+  than the fingers move, and the pinch as a zoom factor. The fingers' touches are withheld while the
+  gesture runs, and the first finger's touch is cancelled when the second lands, so egui never reads
+  the same two fingers as a pinch of its own (which is what turned every scroll into a slow zoom)
+  and the gesture never starts a text selection. The vendored egui-winit releases the pointer when
+  that cancellation arrives but keeps the pointer's place, so the canvas still knows the pointer is
+  over it. WordCraft gets an app-side guard (applied to its own source at build time) that ignores
+  a press — and drops any drag already begun — while the gesture is in progress; it now watches for
+  the backend's cancellation rather than egui's multi-touch state, which the backend keeps clear on
+  purpose. All of this lives in `lib/scrolling.sh` and the vendored backends; comment out the one
+  line in `lib/build-common.sh` that calls the script to build without the app-side guard for
+  testing. It currently covers WordCraft only (the PdfCraft guard was removed at the owner's
+  request).
+- The flick's coast on Android. The app synthesises the momentum for the platforms that send none:
+  macOS and Windows send their own, and so does Chromium on the web (which is why the web build
+  must not make one as well). Android's touchscreen sends no momentum of its own for a two-finger
+  pan, so the builder's `lib/scrolling.sh` no longer excludes Android: a flick coasts to a stop
+  now, the way it does in a browser. Only the smooth deltas feed it, so a mouse's notches still
+  land in one step.
+- The Android system back button does something. winit's Android backend consumes
+  `KEYCODE_BACK` (it reports the key as handled), so Android's own back handling never ran and
+  the button reached the apps only as egui's `Key::BrowserBack` — which almost none of them
+  listen for: the button did nothing at all. The shell now re-labels a back press as **Escape**,
+  the key every app already treats as "close the dialog / cancel / go back", so the button gets
+  its usual meaning with no app change. When the app consumed that Escape (a dialog closed, a
+  panel went back) nothing else happens; when nothing consumed it, the app finishes, which is
+  what back means on Android. The finish runs on the Java main thread (`Activity.finish()`),
+  and the Activity's own `onDestroy` ends the process as it already did.
+- Every app checks GitHub for a newer builder release and offers the download. Each APK carries
+  the builder's own version (currently 0.2.0), and a few seconds after launch a background
+  thread asks GitHub for the repository's latest release; when that version is newer, the user
+  is told and offered the new APK. The check is unobtrusive — off the main thread, after a
+  delay, and skipped once a version has been offered — and any failure (no network, a rate
+  limit, an unexpected API shape) is logged and ignored. The shared checker is one Java class
+  (`templates/android/UpdateCheck.java`) that the builder installs next to every launcher's
+  Activity, so the generated launchers and the per-app adapters share it; the apps need the
+  `INTERNET` permission for it.
+- The back button no longer throws unsaved work away. On the desktop, closing a WordCraft window
+  with unsaved changes asks first ("Do you want to quit without saving unsaved changes?"), and
+  the Android back button now runs the very same check: the app's own `close_requested` opens its
+  own prompt, and the app only ends once the user confirms ("Don't save", or the save finished).
+  Apps without such a check close as they are. The prompt is the app's own, so it looks and
+  behaves exactly like the desktop's.
+- The apps use the fonts in the device's `Fonts` folder. A face dropped in
+  `/storage/emulated/0/Fonts` (or `/sdcard/Fonts`) is now found by the apps' own font scanners —
+  the ones WordCraft, GridCraft, DeckCraft, DesignCraft, VectorCraft and PdfCraft use for
+  document and palette fonts — and by the interface's per-script fallback, so a script the device
+  has no face for can be covered by a font the user supplied. The folder is read once the app has
+  been granted "all files access", which the launcher already asks for. The scanner folders now
+  hold a link per font file rather than a link to one folder, because they have to carry the
+  device's faces and the user's at the same time; a face the user supplied replaces a system file
+  of the same name.
+- PdfCraft can use the device's own fonts as the interface fallback, as it does on the desktop.
+  Its fallback face is an *installed* font, found through the fontconfig configuration the
+  launcher writes, so the configuration now lists the device's font folders and the user's own
+  one; it is rewritten on every start, so a configuration written by an earlier build is not
+  left behind. The face itself is never embedded or shipped — it is read at runtime, like on the
+  desktop.
+
 ### Added (in progress — hover not yet reaching winit)
 - An Android pointer-icon bridge in the vendored `egui-winit`: `pointer_icon.rs` translates the
   `egui::CursorIcon` the interface resolves each frame into an `android.view.PointerIcon` and
@@ -18,6 +254,51 @@
   app's own `open_url` service is likewise unset on Android, so every link path ends here.
 
 ### Fixed
+- PdfCraft refused Arabic text on Android ("The PDF text fonts can't draw “ا” (U+0627)"), while
+  the desktop build accepted it. The apps that embed the shared craft-fonts (WordCraft, PdfCraft)
+  read them from a `CRAFT_FONTS_DIR` build input, and the Android build never provided one: it
+  only made an empty directory where the checkout was expected, so the apps were built with no
+  face of their own for a script the device may not have — and the PDF text writer, which shapes
+  Arabic with that face, refused the text instead of writing it. The builder now fetches the
+  craft-fonts checkout (like the apps' own sources, and keeping a local pin) and points the
+  build at it, so the same faces the desktop release embeds are embedded here. The APKs grow by
+  the faces they now carry (PdfCraft +25 MB, WordCraft +42 MB, which also embeds the Chinese
+  interface face).
+- PdfCraft's last-resort interface face — an *installed* font, found on the desktop by name —
+  was never found on Android, because the device ships the same scripts under other names: its
+  Arabic face is the Naskh family and the Indic scripts are variable fonts, while the app looks
+  for `NotoSansArabic-Regular.ttf` and the static Indic faces. The launcher now offers the
+  device's faces under those names in the font configuration, so the app finds the face it wants
+  (the log line `interface font fallback: …` says which). The interface's own per-script fallback
+  gained the variable-font files, so the Indic scripts (Hindi, Telugu, Sinhala, Tamil) are drawn
+  by the device's own faces instead of blank boxes.
+- CADCraft could not open any drawing on Android. The engine keeps its file formats out on
+  purpose — it stays I/O-agnostic and the *host* installs them as global hooks (the DXF/DWG/SVG
+  reader and writer, the plotter, and the entity codec AutoLISP's `entget`/`entmake`/`entmod`
+  use). The desktop host does that (see `apps/cadcraft/src/main.rs`); the Android launcher did
+  not, and `cadcraft-io` was not even among its dependencies, so the engine had no file formats at
+  all: every open failed with *"invalid parameters for 'open': file formats are not available in
+  this build"*. The launcher now installs the same hooks and links the crate that provides them.
+  A DXF and a real Autodesk DWG both open and draw, and Save As writes a valid DXF (AC1015) to
+  the chosen document.
+- **An app died when it came back from the Android file picker.** Picking a file parks the frame
+  thread (it is the event-loop pump), so the app's window is torn down and recreated while it
+  waits; the queued "window destroyed / window created" events are then handled in one go, and the
+  paint that follows finds a surface whose window no longer exists. egui-wgpu's answer to a lost
+  surface is to *recreate* it, and on Android that means asking Vulkan for a second surface for a
+  window that still has the first — which Vulkan refuses (`ERROR_NATIVE_WINDOW_IN_USE_KHR`), and
+  wgpu turns that refusal into a panic (`expect("AndroidSurface failed")`), so the whole process
+  went down. The builder now ships a patched egui-wgpu: the lost surface is released *before* a
+  new one is made, the device is waited for so the old Vulkan handle is really gone, and on
+  Android the dead surface is simply dropped — `set_window` runs for the current window every
+  frame, so the next frame makes a fresh surface for the window that is there now. CADCraft
+  (DXF/DWG), WordCraft and every other app survive the picker round trip now.
+- WordCraft's file dialog could not be built against the current upstream source. The answer
+  type changed from a single optional path (`Result<Option<String>, String>`) to the list of
+  picked paths, empty when the user cancelled (`Result<Vec<String>, String>`), so that "Add
+  Font…" can pick several files. The launcher's picker now answers in whichever shape the
+  checked-out source declares, and the request it sends no longer names the open variants, so
+  it keeps building against a source that has one open request or several.
 - EffectCraft could not import or export at all: every import said "media import is not available in
   this build" and every export "export is not available in this build". The generated launcher
   started a bare `Session::new()`, which has no media importer, no Render Queue exporter, no

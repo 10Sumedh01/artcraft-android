@@ -77,6 +77,19 @@ The builder is designed to preserve local work. It does not delete an existing s
 
 Update app sources deliberately with Git after preserving your changes. Review the diff before switching versions or incorporating upstream changes.
 
+A checkout is reused only when it is complete. A clone that was interrupted — by a killed build, or by a full disk — leaves a checkout whose Git metadata looks normal while most of the crates are missing from disk; the builder reports that as an incomplete checkout and asks for it to be moved aside, rather than building from it. New clones are written to a scratch directory and moved into place only once they have been checked, so an interrupted clone is never mistaken for a usable checkout.
+
+### The shared craft-fonts
+
+The apps that embed the shared faces (WordCraft, PdfCraft) read them from the
+[craft-fonts](https://github.com/storytold/craft-fonts) checkout, an optional build input they
+take through `CRAFT_FONTS_DIR`. The builder fetches that checkout next to the apps' own sources
+(`source/craft-fonts`, kept like them, so a local pin is not overwritten) and points the build at
+it, so the same faces the desktop release embeds are embedded here — the Arabic, Thai, Georgian
+and Japanese ones, without which the PDF text writer refuses text it cannot shape ("The PDF
+text fonts can't draw …"). The APKs grow by the faces they now carry. A checkout that is present
+but has no `fonts/manifest.txt` is left alone, and the apps build without the faces.
+
 ## Build pipeline
 
 Each build compiles the app's Rust code with [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) into a `jniLibs` tree and packages it with the Gradle Android Plugin (AGP 8.7.3 on the bundled Gradle 8.11.1 wrapper). The launcher runs as a GameActivity — Google's maintained Activity for native apps, whose Java half also hosts the soft keyboard input connection — so the APK's Java side links `androidx.games:games-activity` and AppCompat alongside the platform SDK.
@@ -119,6 +132,12 @@ The launcher uses Android's system fonts alongside each app's embedded fonts. It
 
 A minimal `fonts.conf` provides the font configuration. The links and that file live in the **internal** private directory (`/data/user/0/<pkg>/files`), not the external one: Android's emulated external storage refuses `symlink`, so building them there leaves `$HOME/.fonts` and friends missing and the scanners find no system face — the reason non-Latin scripts broke under v23. `HOME` and `XDG_DATA_HOME` therefore point at the internal directory even though the rest of the app's data is external. This supports scripts including CJK, Arabic, Hebrew, Indic scripts, Thai, Khmer, and Myanmar when suitable fonts are present on the device. Existing app rendering is left unchanged where the app already has glyph coverage. Exact coverage depends on the fonts included by the device manufacturer.
 
+The user's own fonts are found too: a face dropped in `/storage/emulated/0/Fonts` (or `/sdcard/Fonts`, or a subfolder of either) is picked up by the apps' own font scanners and can serve the interface's per-script fallback, so a script the device has no face for can still be drawn. The folder is read once the app has been granted "all files access", which the launcher asks for on first launch — every app asks, the PhotoCraft and VectorCraft adapters included (they previously neither declared the permission nor asked for it, so they could not read it at all). Only one of the three locations above is a real folder, holding a link per font file — a folder can carry the device's faces and the user's together one file at a time — and the other two are links *to* it, so a scanner reading any of them, or two as WordCraft does, reaches one folder however many names it reads and lists nothing twice. An app installed before this change still holds the older single link to `/system/fonts` in each place, which reads as an existing folder yet can hold no links of its own (they would all be made inside the read-only system partition); the first start after the update recognises that leftover and replaces it. A face the user supplied replaces a system file of the same name.
+
+The links are kept current while the app runs: the folder is looked at every couple of seconds and re-linked when something changed, so a font added later — or the "all files access" being granted after the app started, which is how the ask actually plays out — is picked up without having to relaunch the app first. What the apps' font *lists* show is their own business: most of them build the list once per run, so a newly visible face shows up in the list after the app's next start, or right away through the app's own "load system fonts" action where it has one.
+
+PdfCraft's interface fallback — an *installed* face, read at runtime and never embedded — is found the same way, through the font configuration the launcher writes. That configuration also offers the device's faces under the names a desktop system's fonts are known by, because the device ships the same scripts under other names: its Arabic face is the Naskh family and the Indic scripts are variable fonts, while an app looking for an installed face by name expects `NotoSansArabic-Regular.ttf` and the static Indic faces.
+
 ### Soft keyboard and text input
 
 The Android soft keyboard is wired into every app. Each Activity installs an invisible, focusable `EditText`; its `InputConnection` controls keyboard visibility and forwards text commits, composition updates, deletions, and Enter to the Rust shell. The shell converts these into egui input-method events for the currently focused text field.
@@ -141,9 +160,25 @@ Apps follow the phone's own appearance setting — opened in dark mode, the inte
 
 A connected mouse or trackpad gets hover, scroll wheel, and secondary click (the interface's context menu).
 
+A mouse's wheel turns in notches (one notch, one step, and no coasting afterwards), while a trackpad's scroll is smooth and coasts when you flick it — the device itself says which it is, not the size of the amount. A hardware trackpad's own two-finger slide scrolls the document 1:1 in pixels and its two-finger pinch zooms it, the way a browser does it: Android reports the gesture as a classified motion event whose pointer walks across the screen, and the distance it walked is the scroll.
+
+### Touch scrolling and pinch-zoom
+
+A phone or tablet has no wheel, so a two-finger slide scrolls the document and a two-finger pinch zooms it, the way a browser does it. The gesture is recognised once, inside a deadzone: a slide that moves the fingers more than a finger's width scrolls, a pinch that changes the distance between the fingers zooms, and anything in between does nothing at all — so a scroll never turns into a zoom halfway through. A slide tracks the fingers 1:1 in pixels (a little faster, so a long passage is quick to cross) and a flick coasts to a stop, the way it does in a browser. The gesture never starts a text selection, and it never zooms by accident.
+
+### The system back button
+
+Android's back gesture and back key reach the apps. winit's Android backend consumes the key (it reports it as handled), so Android's own back handling never ran and the button arrived as egui's `Key::BrowserBack`, which almost no app listens for — it did nothing at all. The launcher now re-labels a back press as **Escape**, the key every app already treats as "close the dialog / cancel / go back", so the button gets its usual meaning without any app change. If the app consumed that Escape, the button did its job; if nothing consumed it, the app finishes, which is what back means on Android.
+
+Before the app ends, it gets the last word: the apps that guard against losing work run the same check their desktop window-close button runs, so a document with unsaved changes opens the app's own "Do you want to quit without saving unsaved changes?" prompt instead of the app vanishing. The prompt is the app's own, so it looks and behaves exactly like the desktop's.
+
+### Updates
+
+Every APK carries the builder's own version. A few seconds after launch, a background thread asks GitHub for the latest release of the builder's repository; when that version is newer than the one in the app, the user is told and offered the download of the new APK. The check never blocks the app, is skipped once a version has been offered, and any failure (no network, a rate limit, an unexpected API shape) is logged and ignored. The apps need the `INTERNET` permission for it, which the builder adds to every launcher.
+
 ### Drag and drop
 
-Files can be dragged out of the Files app (or a browser) and dropped onto the window — handy in split-screen next to another app. A dropped file is copied into app-private storage off the UI thread and opens through the same path a file shared through the share sheet uses. Persistable read access is requested when the source offers it, since drag grants are otherwise temporary.
+Files can be dragged out of the Files app (or a browser) and dropped onto the window — handy in split-screen next to another app. A dropped file is copied into app-private storage off the UI thread and opens through the same path a file shared through the share sheet uses, so it opens even while the app is sitting untouched. Persistable access is requested when the source offers it, since drag grants are otherwise temporary; write access is asked for first, because a dropped document is saved back to the place it came from.
 
 ### Printing
 
@@ -166,7 +201,7 @@ Every app is registered with Android's **Open with** and share sheets for the fi
 
 File associations are centralized in [`lib/file_associations.py`](lib/file_associations.py) and applied to launcher and adapter manifests to keep them consistent. Extensions Android's MIME database knows are matched by the type it actually reports (for example `.psd` is `image/x-photoshop`, not `image/vnd.adobe.photoshop`), and every extension is also matched by file name so that a provider which stamps a generic `application/octet-stream` still offers the app. Those by-name elements pair the escaped-dot pattern with `android:host="*"` — Android only evaluates a `pathPattern` when the element also declares an authority, and without one a scheme-plus-path element matches every `file://`/`content://` URI — and the same pattern is repeated in a second, VIEW-only element declaring `mimeType="*/*"`, because a filter that declares a MIME type only matches intents that carry one. An app is therefore offered for its own extensions and types and for nothing else.
 
-When a file is opened, shared, or passed through a link, the launcher copies it into app-private storage off the UI thread and opens it through the same path used by the app's own file picker. This is supported while the app is already running as well as on initial launch.
+When a file is opened, shared, or passed through a link, the launcher copies it into app-private storage off the UI thread and opens it through the same path used by the app's own file picker. This is supported while the app is already running as well as on initial launch, and the file opens straight away: egui only draws a frame when something asks it to, so a background watcher asks the app for a repaint as soon as a file is waiting, instead of leaving it in the queue until the user happens to touch the screen.
 
 ## Signing and distribution
 
