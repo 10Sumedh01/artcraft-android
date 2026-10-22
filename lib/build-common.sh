@@ -439,7 +439,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "42"
+GENERATOR_VERSION = "43"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -2010,8 +2010,10 @@ PERSIST_RECIPES = {
 # `InterfaceSize` percentage), so each entry below spells out, per app:
 #   "file"  — a settings file whose absence means "first launch".
 #   "set"   — Rust run once after `persist_load`, against the loaded app state, to raise the scale.
-# LightCraft has no persisted interface scale at all, so it is absent and untouched. `@UI@`/`@ENGINE@`
-# are filled in like the recipes above.
+# LightCraft has no persisted interface scale at all, so it is absent and untouched. PhotoCraft
+# ships its own launcher and carries its own copy of this bootstrap, so it is absent for the same
+# reason (VectorCraft is listed here, but its adapter's copy is the one that runs).
+# `@UI@`/`@ENGINE@` are filled in like the recipes above.
 UI_SCALE_BOOTSTRAP = {
     "effectcraft": {
         "file": "prefs.json",
@@ -2024,7 +2026,10 @@ UI_SCALE_BOOTSTRAP = {
     },
     "vectorcraft": {
         "file": "ui.json",
-        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "uiScaling", "value": 1.5}));''',
+        # VectorCraft's scale is a factor (1.0 is the system's own size); 75% on a phone.
+        # The adapter ships its own launcher, so its copy of this bootstrap is the one that
+        # runs; this entry keeps the value in the builder's own table as well.
+        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "uiScaling", "value": 0.75}));''',
     },
     "wordcraft": {
         "file": "ui.json",
@@ -2032,11 +2037,13 @@ UI_SCALE_BOOTSTRAP = {
     },
     "designcraft": {
         "file": "ui.json",
-        "set": '''inner.ui.ui_scale = 1.5;''',
+        # DesignCraft's scale is a factor (1.0 is the system's own size); 75% on a phone.
+        "set": '''inner.ui.ui_scale = 0.75;''',
     },
     "deckcraft": {
         "file": "ui.json",
-        "set": '''inner.ui.ui_scale = 1.5;''',
+        # DeckCraft's scale is a factor (1.0 is the system's own size); 75% on a phone.
+        "set": '''inner.ui.ui_scale = 0.75;''',
     },
     "soundcraft": {
         "file": "ui.json",
@@ -2045,7 +2052,8 @@ UI_SCALE_BOOTSTRAP = {
     },
     "gridcraft": {
         "file": "ui.json",
-        "set": '''inner.ui.interface_scale = 150;''',
+        # GridCraft's scale is a percentage (75–200); 75% on a phone.
+        "set": '''inner.ui.interface_scale = 75;''',
     },
     "pdfcraft": {
         "file": "ui.json",
@@ -2054,13 +2062,13 @@ UI_SCALE_BOOTSTRAP = {
     "figcraft": {
         "file": "state.json",
         # FigCraft keeps the scale in the engine's preferences, as a factor (1.0 is the system's
-        # own size); 1.5 is one of the sizes its own dialog offers.
-        "set": '''inner.session.prefs.ui_scale = 1.5;''',
+        # own size); 75% on a phone.
+        "set": '''inner.session.prefs.ui_scale = 0.75;''',
     },
     "cadcraft": {
         "file": "profile.json",
         # CadCraft keeps the scale in its options, which are saved with the profile.
-        "set": '''inner.options.interface_scale = 1.5;''',
+        "set": '''inner.options.interface_scale = 0.75;''',
     },
 }
 

@@ -158,7 +158,7 @@ Apps follow the phone's own appearance setting — opened in dark mode, the inte
 
 ### Interface size on a phone
 
-The apps are laid out for a tablet, so on a phone-class screen (Android's own `sw600dp` boundary: the shortest screen edge under 600 density-independent pixels) the first launch raises the interface to 150%, which is where the menus and the ribbon stop being cramped. It happens once, on the first launch only: after that the app's own size setting is yours, and the app never touches it again. Tablets are left at the size the system gives them.
+The apps are laid out for a tablet, so on a phone-class screen (Android's own `sw600dp` boundary: the shortest screen edge under 600 density-independent pixels) the first launch sets an interface size that suits a phone — 150% for the document apps, whose ribbon and menus need the room, and 85% (75% in VectorCraft) for the canvas apps, which draw their work on the screen. It happens once, on the first launch only: after that the app's own size setting is yours, and the app never touches it again. Tablets are left at the size the system gives them.
 
 ### Mouse and trackpad
 

@@ -137,6 +137,11 @@
   be read, since that is the one reason a font dropped there does not show up.
 
 ### Changed
+- The interface size a phone-class screen gets on its first launch is now 85% for the canvas apps
+  (GridCraft, DeckCraft, DesignCraft and FigCraft) and 75% for VectorCraft, instead of 150% for
+  every app: those apps draw their work on a canvas, and a larger interface on a phone takes the
+  room the drawing needs. The document apps (WordCraft, PdfCraft, CadCraft, SoundCraft,
+  EffectCraft and FilmCraft) keep 150%, which is what a ribbon and a menu want.
 - The apps ask for "All files access" again on every launch until it is granted. The ask used to
   happen once, and a dismissal was remembered as an answer that lasted, so an app installed before
   the ask existed never asked at all and could not read the device's storage. The permission is

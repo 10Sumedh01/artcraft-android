@@ -926,11 +926,12 @@ fn android_main(android_app: AndroidApp) {
             );
             let persist = persist_dir(&app_bridge.app);
             if let Some(dir) = &persist {
-                // First launch on a phone-class screen: raise the UI scale to 150 % before the app
+                // First launch on a phone-class screen: set the UI scale to 75 % before the app
                 // reads its settings, then save it, so a user who changes it later keeps their
-                // choice (this runs only while `ui.json` does not exist yet).
+                // choice (this runs only while `ui.json` does not exist yet). VectorCraft draws
+                // its work on a canvas, so a phone gets a smaller interface, not a larger one.
                 if !dir.join("ui.json").exists() && device_is_phone(&app_bridge.app) == Some(true) {
-                    let _ = app.session.execute("prefs.set", &serde_json::json!({"key": "uiScaling", "value": 1.5}));
+                    let _ = app.session.execute("prefs.set", &serde_json::json!({"key": "uiScaling", "value": 0.75}));
                 }
                 persist_load(&mut app, dir);
             }
