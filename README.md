@@ -156,6 +156,10 @@ Every app ships a proper adaptive launcher icon: the app's brand colour as a sol
 
 Apps follow the phone's own appearance setting — opened in dark mode, the interface is dark from the first frame, and switching the phone to light or dark while the app runs re-themes it live, system-bar icons included (the Android side of what the web builds read from `prefers-color-scheme`). The in-app Appearance setting still lets you pin light or dark explicitly; system is its default.
 
+### Interface size on a phone
+
+The apps are laid out for a tablet, so on a phone-class screen (Android's own `sw600dp` boundary: the shortest screen edge under 600 density-independent pixels) the first launch raises the interface to 150%, which is where the menus and the ribbon stop being cramped. It happens once, on the first launch only: after that the app's own size setting is yours, and the app never touches it again. Tablets are left at the size the system gives them.
+
 ### Mouse and trackpad
 
 A connected mouse or trackpad gets hover, scroll wheel, and secondary click (the interface's context menu).

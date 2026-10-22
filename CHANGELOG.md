@@ -3,6 +3,13 @@
 ## v37 — 2026-10-20
 
 ### Fixed
+- The first launch on a phone-class screen did not raise the interface to 150% in most apps, only in
+  PhotoCraft. The launcher asks the Activity whether the device is a phone-class screen
+  (`smallestScreenWidthDp < 600`, Android's own `sw600dp` boundary) over JNI, and the shared
+  Activity had no such method: the call failed, the launcher took the answer for "unknown", and the
+  scale was left alone. The method is in the shared Activity now, and FigCraft and CadCraft — which
+  do have an interface scale, but had no entry in the builder's list of apps that raise it — are in
+  it too. LightCraft has no interface scale at all and is left alone.
 - A hardware trackpad's two-finger scroll did nothing at all. The backend told a mouse, a touchpad
   and a trackball apart by matching the device's whole source against one constant, but Android
   describes a device by a *bitmask*: a touchpad is `SOURCE_MOUSE | SOURCE_TOUCHPAD` (0x0010200a),

@@ -439,7 +439,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "41"
+GENERATOR_VERSION = "42"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -2010,8 +2010,8 @@ PERSIST_RECIPES = {
 # `InterfaceSize` percentage), so each entry below spells out, per app:
 #   "file"  — a settings file whose absence means "first launch".
 #   "set"   — Rust run once after `persist_load`, against the loaded app state, to raise the scale.
-# Apps with no persisted interface scale (lightcraft, figcraft, cadcraft) are absent and are
-# untouched. `@UI@`/`@ENGINE@` are filled in like the recipes above.
+# LightCraft has no persisted interface scale at all, so it is absent and untouched. `@UI@`/`@ENGINE@`
+# are filled in like the recipes above.
 UI_SCALE_BOOTSTRAP = {
     "effectcraft": {
         "file": "prefs.json",
@@ -2050,6 +2050,17 @@ UI_SCALE_BOOTSTRAP = {
     "pdfcraft": {
         "file": "ui.json",
         "set": '''inner.ui_scale = @UI@::ui_scale::valid(1.5);''',
+    },
+    "figcraft": {
+        "file": "state.json",
+        # FigCraft keeps the scale in the engine's preferences, as a factor (1.0 is the system's
+        # own size); 1.5 is one of the sizes its own dialog offers.
+        "set": '''inner.session.prefs.ui_scale = 1.5;''',
+    },
+    "cadcraft": {
+        "file": "profile.json",
+        # CadCraft keeps the scale in its options, which are saved with the profile.
+        "set": '''inner.options.interface_scale = 1.5;''',
     },
 }
 
