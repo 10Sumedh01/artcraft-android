@@ -38,6 +38,22 @@
   two-finger pinch is reported as a zoom, the way a browser reports it. The classification is a
   separate, tested function (`vendor/winit/src/platform_impl/android/device_kind.rs`, with a host
   test in `tests/android_device_kind.rs`).
+- The soft keyboard rose over the document while it was being scrolled or drawn on. Android shows
+  the keyboard whenever the focused text field asks for it, and the canvas — holding the caret —
+  asked on every frame, so a two-finger scroll or a pen stroke raised it over the very page the
+  user was working on. A scroll, a pan or a drawing gesture now surrenders the keyboard for the
+  frame and asks the shell to put it away; the shell reads that request after the frame ran and
+  calls the Activity's `imeHide`. A drag that belongs to a gesture no longer takes focus either,
+  and on Android the canvas takes focus only from an explicit tap, so nothing raises the keyboard
+  before the user touches the page. WordCraft only (see `lib/scrolling.sh`, `lib/ime.sh` and the
+  launcher template in `lib/build-common.sh`).
+- Backspace on the soft keyboard sometimes erased two characters. Some input methods report one
+  press twice — through `deleteSurroundingText` and through a synthesised `sendKeyEvent` — and the
+  second report, forwarded to the host view, reached winit as another real Backspace. The two
+  reports of one press are now recognised as a pair (different methods, microseconds apart) and
+  the second is dropped, while a quick double-tap — two presses of the same method — still erases
+  twice; the synthesised key pair is consumed at the host view so it never reaches the native
+  queue.
 - A desktop window (Samsung DeX and the other freeform modes) cut the top off the interface. A
   desktop window carries a title bar of its own, which the system draws over the top of the window,
   and its inset is a *consuming* one: the system hands it to the app instead of applying it to the
