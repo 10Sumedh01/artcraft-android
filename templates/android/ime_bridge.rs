@@ -63,6 +63,29 @@ pub mod ime {
             }
         }
 
+        /// Hide the soft keyboard by calling the Activity's `imeHide`. Used when focus is
+        /// surrendered during scroll/draw so the keyboard doesn't persist.
+        pub fn hide_ime(&self) -> Result<(), String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<()> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    match env.call_method(
+                        &*activity,
+                        jni_str!("imeHide"),
+                        jni_sig!("()V"),
+                        &[],
+                    ) {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            env.exception_clear();
+                            Err(error)
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }
+
         fn next_event(&self) -> Result<Option<String>, String> {
             self.vm
                 .attach_current_thread(|env| -> jni::errors::Result<Option<String>> {

@@ -83,8 +83,21 @@ public final class VectorCraftActivity extends GameActivity {
     private EditText imeView;
     // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
     private volatile boolean imeWanted = false;
-    // Some IMEs call both deleteSurroundingText and sendKeyEvent for backspace; queue only one.
-    private volatile long lastImeDeleteAt = 0L;
+    // Some IMEs report one backspace press twice, through two different calls:
+    // `deleteSurroundingText(1,0)` and `sendKeyEvent(KEYCODE_DEL)`. Both arrive back to back, in
+    // the same IME dispatch — microseconds apart — while two deliberate taps are always further
+    // apart (the finger has to lift and press again). So only a *pair of different methods* within
+    // `IME_DELETE_PAIR_MS` is treated as a repeat; the second call is dropped, and the same method
+    // called twice is never dropped (a quick double-tap still erases twice). Both timestamps are
+    // remembered because an IME may send either order.
+    private static final long IME_DELETE_PAIR_MS = 30L;
+    private volatile long lastImeDeleteSurroundingAt = 0L;
+    private volatile long lastImeDeleteKeyAt = 0L;
+    // Key codes an IME synthesised through `sendKeyEvent` and which the host view must therefore
+    // consume instead of letting them bubble up to the native input queue (see the host's
+    // `onKeyDown`/`onKeyUp`). Guarded by itself: `sendKeyEvent` runs on the IME's thread and the
+    // key dispatch on the main thread.
+    private final java.util.Set<Integer> imeKeySynthesized = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
     // Documents the system asked this app to open (an ACTION_VIEW/ACTION_SEND it is registered for):
     // the private path of each staged copy, drained one per call by the Rust shell through
@@ -344,12 +357,9 @@ public final class VectorCraftActivity extends GameActivity {
                         @Override
                         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                             if (beforeLength > 0 || afterLength > 0) {
-                                long now = android.os.SystemClock.uptimeMillis();
-                                if (now - lastImeDeleteAt < 150) {
-                                    return super.deleteSurroundingText(beforeLength, afterLength);
+                                if (claimDelete("d")) {
+                                    queueImeEvent("d" + beforeLength + "," + afterLength);
                                 }
-                                lastImeDeleteAt = now;
-                                queueImeEvent("d" + beforeLength + "," + afterLength);
                             }
                             return super.deleteSurroundingText(beforeLength, afterLength);
                         }
@@ -365,23 +375,25 @@ public final class VectorCraftActivity extends GameActivity {
                             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                                 int code = event.getKeyCode();
                                 if (code == KeyEvent.KEYCODE_DEL) {
-                                    long now = android.os.SystemClock.uptimeMillis();
-                                    if (now - lastImeDeleteAt < 150) {
-                                        return super.sendKeyEvent(event);
+                                    if (claimDelete("s")) {
+                                        queueImeEvent("d1,0");
                                     }
-                                    lastImeDeleteAt = now;
-                                    queueImeEvent("d1,0");
                                 } else if (code == KeyEvent.KEYCODE_FORWARD_DEL) {
-                                    long now = android.os.SystemClock.uptimeMillis();
-                                    if (now - lastImeDeleteAt < 150) {
-                                        return super.sendKeyEvent(event);
+                                    if (claimDelete("s")) {
+                                        queueImeEvent("d0,1");
                                     }
-                                    lastImeDeleteAt = now;
-                                    queueImeEvent("d0,1");
                                 } else if (code == KeyEvent.KEYCODE_ENTER) {
                                     queueImeEvent("a6");
                                 }
                             }
+                            // An IME answers some keys by sending a synthesised key event, and the
+                            // wrapper forwards it to the host view. Without this the host's
+                            // `onKeyDown` would return false and the event would bubble up to the
+                            // Activity, into GameActivity's native queue and out through winit as a
+                            // *second* deletion (a real Backspace) on top of the one queued above —
+                            // the double-delete. `onKeyDown`/`onKeyUp` use the flag to consume the
+                            // pair here, so neither reaches the native path.
+                            imeKeySynthesized.add(event.getKeyCode());
                             return super.sendKeyEvent(event);
                         }
                     };
@@ -389,6 +401,13 @@ public final class VectorCraftActivity extends GameActivity {
 
                 @Override
                 public boolean onKeyDown(int keyCode, KeyEvent event) {
+                    // A key the IME synthesised (see sendKeyEvent above): its deletion was already
+                    // queued, so consuming it here stops it bubbling to the Activity and reaching
+                    // winit as a second Backspace. Physical key events never carry the flag, so they
+                    // still fall through to the native queue below and keep working.
+                    if (imeKeySynthesized.contains(keyCode)) {
+                        return true;
+                    }
                     // Let hardware key events fall through to the native input queue (winit), exactly
                     // as they did before this view existed; the soft keyboard talks to us through the
                     // InputConnection instead. This keeps physical keyboards working.
@@ -397,6 +416,9 @@ public final class VectorCraftActivity extends GameActivity {
 
                 @Override
                 public boolean onKeyUp(int keyCode, KeyEvent event) {
+                    if (imeKeySynthesized.remove(keyCode)) {
+                        return true;
+                    }
                     return false;
                 }
 
@@ -515,6 +537,29 @@ public final class VectorCraftActivity extends GameActivity {
         } catch (Throwable error) {
             Log.w(TAG, "Could not wake the native loop for a keyboard event", error);
         }
+    }
+
+    /**
+     * Whether a delete call should be handed to the shell, or dropped as the second half of one
+     * press an IME reported twice.
+     *
+     * Some IMEs answer one backspace with two different calls — `deleteSurroundingText(1,0)` and
+     * `sendKeyEvent(KEYCODE_DEL)`. They arrive back to back in the same dispatch, so a call of the
+     * *other* method within {@link #IME_DELETE_PAIR_MS} of this one is the repeat and is dropped.
+     * The same method twice is always allowed: two quick taps of one key are two deletions.
+     */
+    private boolean claimDelete(String method) {
+        long now = android.os.SystemClock.uptimeMillis();
+        long lastOther = "d".equals(method) ? lastImeDeleteKeyAt : lastImeDeleteSurroundingAt;
+        if (lastOther != 0L && now - lastOther < IME_DELETE_PAIR_MS) {
+            return false;
+        }
+        if ("d".equals(method)) {
+            lastImeDeleteSurroundingAt = now;
+        } else {
+            lastImeDeleteKeyAt = now;
+        }
+        return true;
     }
 
     /**

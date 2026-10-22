@@ -2645,6 +2645,26 @@ icon = "@mipmap/ic_launcher"
         saf_block = (root / "templates" / "android" / "saf_bridge.rs").read_text()
         saf_block = saf_block + "\n" + saf["state"] + saf["services"] + saf["poll"]
 
+    # The soft keyboard is put away as soon as the app is scrolling or drawing rather than
+    # editing. The app's canvas decides that and sets `request_ime_hide` (see lib/scrolling.sh,
+    # which patches WordCraft's canvas); the shell reads it here, after the frame ran, and tells
+    # the Activity to hide the keyboard. Only WordCraft carries the flag, so only it gets the
+    # block; the other apps keep the keyboard where the platform puts it.
+    ime_hide_logic = ""
+    if app == "wordcraft":
+        ime_hide_logic = (
+            "        // The canvas worked out that the user is scrolling or drawing, not editing:\n"
+            "        // put the soft keyboard away at once. It is read here, after the frame ran,\n"
+            "        // because the input hook and the frame itself run before the IME output is\n"
+            "        // handed to the platform.\n"
+            "        if self.inner.request_ime_hide {\n"
+            "            self.inner.request_ime_hide = false;\n"
+            "            if let Err(error) = self.ime.hide_ime() {\n"
+            "                log::warn!(\"Could not hide the soft keyboard: {error}\");\n"
+            "            }\n"
+            "        }\n"
+        )
+
     if has_eframe_app:
         inner_logic = "self.inner.logic(ctx, frame);"
         inner_ui = "self.inner.ui(ui, frame);"
@@ -3341,7 +3361,7 @@ impl Drop for AndroidShell {{
 impl eframe::App for AndroidShell {{
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {{
 {intent_logic}{saf_logic_poll}{persist_logic}{staged_logic}        {inner_logic}
-        self.sync_bar_appearance(ctx);
+{ime_hide_logic}        self.sync_bar_appearance(ctx);
 {quit_check}    }}
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {{

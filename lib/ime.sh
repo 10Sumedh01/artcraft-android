@@ -35,6 +35,7 @@ fi
 
 python3 - "$SRC" "$APP" <<'PY'
 from pathlib import Path
+import os
 import sys
 
 src, app = Path(sys.argv[1]), Path(sys.argv[2])
@@ -54,6 +55,43 @@ def fix(rel: str, old: str, new: str) -> None:
         return
     path.write_text(text.replace(old, new, 1))
     fixed.append(rel)
+
+
+# Instrumentation for work on the keyboard: every event the shell drains is logged, so a
+# device's logcat shows whether one press queued two events. Off unless ARTCRAFT_IME_TRACE=1.
+def trace(path_rel: str) -> None:
+    path = android_dir / path_rel
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    marker = "    public String imePoll() {\n        return imeEvents.poll();\n    }"
+    traced = (
+        "    public String imePoll() {\n"
+        "        String event = imeEvents.poll();\n"
+        "        if (event != null) Log.i(TAG, \"imePoll -> \" + event);\n"
+        "        return event;\n"
+        "    }"
+    )
+    if marker in text and "imePoll ->" not in text:
+        path.write_text(text.replace(marker, traced, 1))
+        fixed.append(path_rel)
+        text = path.read_text()
+    # Every queued event, at the source.
+    marker = "    private void queueImeEvent(String event) {\n        imeEvents.offer(event);"
+    traced = "    private void queueImeEvent(String event) {\n        Log.i(TAG, \"queueImeEvent \" + event);\n        imeEvents.offer(event);"
+    if marker in text and "queueImeEvent \" + event" not in text:
+        path.write_text(text.replace(marker, traced, 1))
+        fixed.append(path_rel + " (queue)")
+        text = path.read_text()
+    # Whether the shell ever asks for the keyboard, and what the Activity does about it.
+    for signature in ("public void imeShow() {", "public void imeHide() {", "public void imeInteraction() {"):
+        if signature in text:
+            traced = signature + "\n        Log.i(TAG, \"" + signature.split()[2] + "\");"
+            if traced not in text:
+                path.write_text(text.replace(signature, traced, 1))
+                fixed.append(path_rel + " (" + signature.split()[2] + ")")
+                text = path.read_text()
 
 
 # --- The Activity: notice the dismissal, and bring the keyboard back on the next edit. ---
@@ -226,6 +264,9 @@ fix(
         self.ime.interaction(raw);
 """,
 )
+
+if os.environ.get("ARTCRAFT_IME_TRACE") == "1":
+    trace(rel)
 
 if fixed:
     print(f"  Patched the soft keyboard's return for {app}: {', '.join(fixed)}")
