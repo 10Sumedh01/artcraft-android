@@ -103,6 +103,9 @@ jobs:
       - name: Build ${{ matrix.app }} APK
         env:
           BUILD_MODE: ${{ inputs.mode || 'release' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: |
           mkdir -p logs
           if [ "$BUILD_MODE" = "debug" ]; then
