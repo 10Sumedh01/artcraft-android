@@ -1,0 +1,184 @@
+name: Build APKs
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'App to build (or "all")'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - photocraft
+          - vectorcraft
+          - filmcraft
+          - lightcraft
+          - pdfcraft
+          - effectcraft
+          - designcraft
+          - figcraft
+          - wordcraft
+          - soundcraft
+          - deckcraft
+          - cadcraft
+          - gridcraft
+      mode:
+        description: 'Build mode'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.app == 'all' || github.event.inputs.app == matrix.app
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - photocraft
+          - vectorcraft
+          - filmcraft
+          - lightcraft
+          - pdfcraft
+          - effectcraft
+          - designcraft
+          - figcraft
+          - wordcraft
+          - soundcraft
+          - deckcraft
+          - cadcraft
+          - gridcraft
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Configure JDK for build script
+        run: |
+          sudo mkdir -p /opt/jdk
+          sudo ln -s "$JAVA_HOME" /opt/jdk/temurin-21
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: |
+          if ! command -v cargo-ndk >/dev/null 2>&1; then
+            mkdir -p "$HOME/.cargo/bin"
+            curl -fsSL https://github.com/bbqsrc/cargo-ndk/releases/download/v4.1.2/cargo-ndk-x86_64-unknown-linux-musl-v4.1.2.tgz | tar -xz --strip-components=1 -C "$HOME/.cargo/bin"
+            chmod +x "$HOME/.cargo/bin/cargo-ndk"*
+          fi
+          cargo ndk -V
+
+      - name: Configure Android SDK and NDK
+        run: |
+          # Use pre-installed Android SDK and NDK on the runner
+          if [ -d "$ANDROID_HOME/ndk/27.2.12479018" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
+            echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
+          elif [ -d "$ANDROID_HOME/ndk" ]; then
+            LATEST_NDK=$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+            if [ -n "$LATEST_NDK" ]; then
+              echo "ANDROID_NDK_HOME=$LATEST_NDK" >> $GITHUB_ENV
+              echo "NDK_HOME=$LATEST_NDK" >> $GITHUB_ENV
+            fi
+          fi
+          echo "ARTCRAFT_BUILD_TOOLS_VERSION=35.0.0" >> $GITHUB_ENV
+
+      - name: Build ${{ matrix.app }} APK
+        env:
+          BUILD_MODE: ${{ github.event.inputs.mode || 'release' }}
+        run: |
+          if [ "$BUILD_MODE" = "debug" ]; then
+            bash build-debug.sh -${{ matrix.app }}
+          else
+            bash build.sh -${{ matrix.app }}
+          fi
+
+      - name: Upload ${{ matrix.app }} APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-apk
+          path: output/*.apk
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-build-log
+          path: logs/
+
+  bundle:
+    name: Bundle All APKs
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all APK artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: all-apks
+          pattern: '*-apk'
+          merge-multiple: true
+
+      - name: Check and list APKs
+        id: check_apks
+        run: |
+          mkdir -p all-apks
+          if compgen -G "all-apks/*.apk" > /dev/null; then
+            echo "Found APKs:"
+            ls -lh all-apks/*.apk
+            echo "has_apks=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No APKs found to bundle."
+            echo "has_apks=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload all APKs combined artifact
+        if: steps.check_apks.outputs.has_apks == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-all-apks
+          path: all-apks/*.apk
+
+      - name: Create Release on Tag Push
+        if: startsWith(github.ref, 'refs/tags/v') && steps.check_apks.outputs.has_apks == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: all-apks/*.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
