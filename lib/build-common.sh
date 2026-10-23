@@ -24,6 +24,7 @@ Options:
 App names:
   photocraft vectorcraft filmcraft lightcraft pdfcraft effectcraft
   designcraft figcraft wordcraft soundcraft deckcraft cadcraft gridcraft
+  subcraft
 
 Examples:
   bash build.sh -photocraft
@@ -103,12 +104,20 @@ case "$APP" in
     deckcraft) TITLE="DeckCraft" ;;
     cadcraft) TITLE="CADCraft" ;;
     gridcraft) TITLE="GridCraft" ;;
+    subcraft) TITLE="SubCraft" ;;
     *) echo "Unsupported app: $APP" >&2; usage; exit 2 ;;
 esac
 if [[ -n "$APPNAME" ]]; then TITLE="$APPNAME"; fi
 
 SRC="source/$APP"
 REPO="https://github.com/storytold/$APP.git"
+# SubCraft is not part of the `storytold` craft family: it is a community 3D-texturing app that
+# happens to be built on the same egui/eframe stack, so it lives at a different origin.
+APP_ORIGIN="https://github.com/storytold/$APP"
+if [[ "$APP" == "subcraft" ]]; then
+    REPO="https://github.com/Aalzard/subcraft.git"
+    APP_ORIGIN="https://github.com/Aalzard/subcraft"
+fi
 
 # The builder's own version, baked into every APK. The app compares it with the latest GitHub
 # release of this repository on launch and offers the download when GitHub has a newer one
@@ -163,7 +172,7 @@ python3 -c 'import tomllib' >/dev/null 2>&1 || fail "Python 3.11+ with tomllib i
 # Apps whose launcher (adapter or builder-generated) ships a Java Storage Access Framework Activity.
 # Kept here in addition to the manifest check below so bridge verification covers the very first
 # build too, before the launcher has been generated. Keep in sync with SAF_RECIPES in this file.
-SAF_APPS=" designcraft deckcraft gridcraft wordcraft lightcraft effectcraft filmcraft cadcraft soundcraft pdfcraft figcraft "
+SAF_APPS=" designcraft deckcraft gridcraft wordcraft lightcraft effectcraft filmcraft cadcraft soundcraft pdfcraft figcraft subcraft "
 needs_saf() {
     [[ " $SAF_APPS " == *" $1 "* ]]
 }
@@ -442,7 +451,7 @@ if [[ -e "$SRC" ]]; then
     [[ -d "$SRC/.git" ]] || fail "$SRC exists but is not a Git checkout. Move it aside manually before retrying."
     ORIGIN="$(git -C "$SRC" remote get-url origin 2>/dev/null || true)"
     case "${ORIGIN%.git}" in
-        "https://github.com/storytold/$APP") ;;
+        "$APP_ORIGIN") ;;
         *) fail "$SRC has unexpected origin '$ORIGIN'; refusing to reuse or overwrite it." ;;
     esac
     if ! source_tree_is_complete "$SRC"; then
@@ -522,6 +531,11 @@ PY
 # backends above.
 bash "$ROOT/lib/scrolling.sh" "$SRC" "$APP" "$TITLE"
 
+# SubCraft's Android file hand-off (a public `files::deliver_android`) is applied by its own script,
+# so it can be turned off for testing by commenting out the line below. It patches the app's own
+# source at build time; only SubCraft is touched.
+bash "$ROOT/lib/subcraft.sh" "$SRC" "$APP" "$TITLE"
+
 say 4 "Preparing the GameActivity launcher..."
 if [[ -x "adapters/$APP/prepare.sh" ]]; then
     echo "Using app-specific adapter: adapters/$APP/prepare.sh"
@@ -543,7 +557,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "46"
+GENERATOR_VERSION = "53"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -561,10 +575,23 @@ if (custom / "Cargo.toml").is_file() and (custom / "src" / "lib.rs").is_file():
     # The shared Android soft-keyboard bridge, referenced by `mod ime_bridge;` in the adapter.
     shutil.copy2(root / "templates" / "android" / "ime_bridge.rs", android_dir / "src" / "ime_bridge.rs")
     # The adapter's launcher gets the same icons as the generated ones: density mipmaps plus the
-    # API 26+ adaptive layers (see lib/app_icons.py).
+    # API 26+ adaptive layers (see lib/app_icons.py). An adapter that ships its own `assets/app-icon`
+    # seeds the app tree with it when the app has no icon of its own (SubCraft ships only a Windows
+    # .ico), so the artwork comes from the adapter instead of another app's branding. Icon generation
+    # is best-effort: an app with no usable artwork keeps the generic Android icon rather than
+    # failing the whole build (like the PhotoCraft adapter's prepare.sh).
     import app_icons
 
-    app_icons.generate(src, app, android_dir / "res", Path(appicon) if appicon else None)
+    if (custom / "assets" / "app-icon").is_dir() and not (src / "assets" / "app-icon").is_dir():
+        shutil.copytree(custom / "assets" / "app-icon", src / "assets" / "app-icon")
+    try:
+        app_icons.generate(src, app, android_dir / "res", Path(appicon) if appicon else None)
+    except SystemExit as error:
+        print(f"No icon could be generated for {app} ({error}); using a generic Android icon.")
+        manifest = android_dir / "Cargo.toml"
+        manifest.write_text("\n".join(
+            line for line in manifest.read_text().splitlines() if not line.startswith("icon = ")
+        ) + "\n")
     # Advertise the app's file associations (Android open/share intent filters) in the copied
     # manifest, from the same table the generated launchers use.
     file_associations.patch_cargo_toml(android_dir / "Cargo.toml", app)
@@ -1219,7 +1246,37 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
     let pick_open_state = Arc::clone(&state);
     let pick_save_state = Arc::clone(&state);
     let open_inbox = inbox.clone();
+    let print_bridge = bridge.clone_ref();
     Services {
+        // Android does not let an app enumerate printers: printer choice, paper, duplex, colour and
+        // page range live in the system print dialog. Offer its one entry — named and defaulted so
+        // File > Print's automatic selection settles on it and enables submission — and hand the
+        // collated PDF to the Java print bridge, which stages it and opens that dialog. Without
+        // these two, every File > Print said "Printing is unavailable here; export a PDF instead."
+        printers: Some(Box::new(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(vec![gridcraft_ui_egui::printing::Printer {
+                name: "Android print system".to_owned(),
+                default: true,
+            }]);
+            rx
+        })),
+        print_native: Some(Box::new(move |bytes: Vec<u8>, _settings: gridcraft_ui_egui::printing::Settings| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Java answers inside this call ("OK", or the reason it failed); an empty receipt
+            // renders as the clean "Print job submitted." message, as the desktop spooler would.
+            let receipt = print_bridge
+                .print_document("GridCraft", &bytes)
+                .and_then(|answer| {
+                    if answer == "OK" {
+                        Ok(String::new())
+                    } else {
+                        Err(answer)
+                    }
+                });
+            let _ = tx.send(receipt);
+            rx
+        })),
         // Save As / Export use the synchronous `pick_save`, which Android never provided, so those
         // menu items were a silent no-op. The picker blocks on the frame thread, which the SAF
         // bridge makes safe (`NonblockingCallbacks`), exactly as EffectCraft does.
@@ -1815,7 +1872,7 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState, _inbox: &SafInbox) {
     let launcher_bridge = saf_bridge.clone_ref();
     rfd::artcraft_saf::install(std::sync::Arc::new(move |id, kind| {
         match kind {
-            rfd::artcraft_saf::Kind::Open => { launcher_bridge.request_open(id, false).ok(); }
+            rfd::artcraft_saf::Kind::Open { multiple } => { launcher_bridge.request_open(id, multiple).ok(); }
             rfd::artcraft_saf::Kind::Save(ref name) => { launcher_bridge.request_save(id, name).ok(); }
             rfd::artcraft_saf::Kind::Folder => { launcher_bridge.request_folder(id).ok(); }
         }
@@ -2104,76 +2161,43 @@ PERSIST_RECIPES = {
     },
 }
 
-# ---- First-launch UI scale on small screens ----------------------------------------------------
-# On a phone-class screen (smallestScreenWidthDp < 600, Android's own sw600dp tablet boundary —
-# see SafActivity.isPhoneDevice) the desktop-sized interface is uncomfortably small, so the *first*
-# launch raises the app's UI scale to 150%. Tablets, and every later launch, are left exactly as the
-# user set them: the bootstrap only runs when this app's own settings file does not exist yet.
+# ---- UI scale on high-density screens -----------------------------------------------------------
+# A dense screen (more than 600 dpi, see SafActivity.isHighDensityDevice) already draws the system
+# interface very large, so the app's own interface scale has to be set explicitly or it comes out
+# oversized. Screens at or below that density — tablets in particular — are left untouched: the app
+# keeps its own default, Auto, which is the display scale Android reports and is comfortable there.
+#
+# The choice is remembered in a `device_class` sidecar (`device_scale_first_time`), so a first
+# launch, and an upgrade from a version without this bootstrap, get the scale once, while a user's
+# own later change is kept.
 #
 # The apps do not share one scale key or representation (int percent, choice string, f32 factor,
-# `InterfaceSize` percentage), so each entry below spells out, per app:
-#   "file"  — a settings file whose absence means "first launch".
-#   "set"   — Rust run once after `persist_load`, against the loaded app state, to raise the scale.
-# LightCraft has no persisted interface scale at all, so it is absent and untouched. PhotoCraft
-# ships its own launcher and carries its own copy of this bootstrap, so it is absent for the same
-# reason (VectorCraft is listed here, but its adapter's copy is the one that runs).
+# `InterfaceSize` percentage), so each entry below spells out, per app, the Rust run after
+# `persist_load` (against the loaded state) on such a screen. The values are the ones each app's own
+# settings JSON stores — e.g. EffectCraft's `uiScale` is a percent, WordCraft's an absolute
+# `InterfaceSize`, DesignCraft's `uiScale` a factor — so the app accepts them like its own.
+# LightCraft has no persisted interface scale at all, so it is absent and untouched. PhotoCraft and
+# SubCraft ship their own launchers and carry their own copy of this bootstrap; VectorCraft is
+# listed here only so the builder's table is complete (its adapter's copy is the one that runs).
 # `@UI@`/`@ENGINE@` are filled in like the recipes above.
 UI_SCALE_BOOTSTRAP = {
-    "effectcraft": {
-        "file": "prefs.json",
-        # EffectCraft stores prefs through `DirConfig`; `prefs.set` clamps to 75–200 %.
-        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
-    },
-    "filmcraft": {
-        "file": "preferences.json",
-        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
-    },
-    "vectorcraft": {
-        "file": "ui.json",
-        # VectorCraft's scale is a factor (1.0 is the system's own size); 75% on a phone.
-        # The adapter ships its own launcher, so its copy of this bootstrap is the one that
-        # runs; this entry keeps the value in the builder's own table as well.
-        "set": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "uiScaling", "value": 0.75}));''',
-    },
-    "wordcraft": {
-        "file": "ui.json",
-        "set": '''inner.ui.interface_size = @UI@::theme::InterfaceSize::from_percent(150.0).unwrap_or_default();''',
-    },
-    "designcraft": {
-        "file": "ui.json",
-        # DesignCraft's scale is a factor (1.0 is the system's own size); 75% on a phone.
-        "set": '''inner.ui.ui_scale = 0.75;''',
-    },
-    "deckcraft": {
-        "file": "ui.json",
-        # DeckCraft's scale is a factor (1.0 is the system's own size); 75% on a phone.
-        "set": '''inner.ui.ui_scale = 0.75;''',
-    },
-    "soundcraft": {
-        "file": "ui.json",
-        # SoundCraft's slider tops out at 1.5, so 150 % is its maximum.
-        "set": '''inner.ui.ui_scale = 1.5;''',
-    },
-    "gridcraft": {
-        "file": "ui.json",
-        # GridCraft's scale is a percentage (75–200); 75% on a phone.
-        "set": '''inner.ui.interface_scale = 75;''',
-    },
-    "pdfcraft": {
-        "file": "ui.json",
-        "set": '''inner.ui_scale = @UI@::ui_scale::valid(1.5);''',
-    },
-    "figcraft": {
-        "file": "state.json",
-        # FigCraft keeps the scale in the engine's preferences, as a factor (1.0 is the system's
-        # own size); 75% on a phone.
-        "set": '''inner.session.prefs.ui_scale = 0.75;''',
-    },
-    "cadcraft": {
-        "file": "profile.json",
-        # CadCraft keeps the scale in its options, which are saved with the profile.
-        "set": '''inner.options.interface_scale = 0.75;''',
-    },
+    "effectcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
+    "filmcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
+    # VectorCraft's scale is a factor (1.0 is the system's own size); 0.75 gives the canvas more room.
+    "vectorcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "uiScaling", "value": 0.75}));''',
+    # WordCraft's sizes are absolute ("100%" is one screen pixel per point, not the system's scale),
+    # so a dense screen gets 150 % of that baseline.
+    "wordcraft": '''inner.ui.interface_size = @UI@::theme::InterfaceSize::from_percent(150.0).unwrap_or_default();''',
+    "designcraft": '''inner.ui.ui_scale = 0.75;''',
+    "deckcraft": '''inner.ui.ui_scale = 0.75;''',
+    # SoundCraft's slider tops out at 1.5.
+    "soundcraft": '''inner.ui.ui_scale = 1.5;''',
+    # GridCraft's scale is a percentage (75–200).
+    "gridcraft": '''inner.ui.interface_scale = 75;''',
+    "pdfcraft": '''inner.ui_scale = @UI@::ui_scale::valid(1.5);''',
+    # FigCraft keeps the scale in the engine's preferences, as a factor.
+    "figcraft": '''inner.session.prefs.ui_scale = 0.75;''',
+    "cadcraft": '''inner.options.interface_scale = 0.75;''',
 }
 
 # Run once right after `persist_load`, to open a launch on the app's own homepage instead of an
@@ -2250,6 +2274,31 @@ fn persist_write(dir: &std::path::Path, name: &str, bytes: &[u8]) {
     if let Err(error) = written {
         log::warn!("settings: {}: {error}", path.display());
     }
+}
+
+/// Whether the high-density UI scale should be applied to this launch, and the sidecar that
+/// remembers that it was.
+///
+/// The scale belongs to the *device*, but the settings file it lands in belongs to the *user*: it is
+/// written on the first launch and never revisited, so
+///   * a screen that later stops being high-density (a foldable, an external display, a display-size
+///     change) kept the old scale, and
+///   * an install that already had a settings file — an upgrade from a version before this
+///     bootstrap existed — never got it at all, so an updated app and a freshly installed one
+///     behaved differently.
+///
+/// The choice is remembered in its own sidecar (`device_class`), separate from the app's settings,
+/// so "first launch" means "the scale has not been set for this device yet", not "first launch of
+/// this file". A user who changes the scale by hand keeps it: the sidecar already says it was
+/// applied, so nothing is re-applied.
+#[allow(dead_code)]
+fn device_scale_first_time(dir: &std::path::Path) -> bool {
+    let marker = dir.join("device_class");
+    if std::fs::read_to_string(&marker).ok().is_some_and(|saved| saved.trim() == "scaled") {
+        return false;
+    }
+    persist_write(dir, "device_class", b"scaled");
+    true
 }
 '''
 
@@ -2379,19 +2428,22 @@ fn persist_save(inner: &mut {app_type}, dir: &std::path::Path) {{
     _after = PERSIST_AFTER_LOAD.get(app, "").replace("@UI@", ui_ident)
     _bootstrap = UI_SCALE_BOOTSTRAP.get(app)
     if _bootstrap:
-        # Run only on a true first launch (this app's settings file still absent) on a phone-class
-        # screen. The set runs *after* `persist_load` so nothing the loader applies can overwrite it,
-        # then `persist_save` writes it at once; a present file means the bootstrap never runs again,
-        # so a user who changes the scale later keeps their choice.
-        _set = _bootstrap["set"].replace("@UI@", ui_ident).replace("@ENGINE@", engine_ident)
+        # Give the app its own UI-scale default on a high-density screen, once (`device_scale_first_time`,
+        # whose `device_class` sidecar keeps this independent of the settings file — so an upgrade
+        # gets it too, while a user's own later change is kept). Every other screen is left at the
+        # app's own default — Auto, the display scale Android reports — which is already comfortable
+        # there.
+        #
+        # The scale runs *after* `persist_load` (so nothing the loader applies can overwrite it) and
+        # is written straight back by `persist_save`.
+        _scale = _bootstrap.replace("@UI@", ui_ident).replace("@ENGINE@", engine_ident)
         _bootstrap_body = (
             "let persist = persist_dir(&app);\n"
             "        if let Some(dir) = &persist {\n"
-            f'            let scale_first_launch = !dir.join("{_bootstrap["file"]}").exists();\n'
             "            persist_load(&mut inner, dir);\n"
             + _after
-            + "            if scale_first_launch && device_is_phone(&app) == Some(true) {\n"
-            f"                {_set}\n"
+            + "            if device_is_high_density(&app) == Some(true) && device_scale_first_time(dir) {\n"
+            f"                {_scale}\n"
             "                persist_save(&mut inner, dir);\n"
             "            }\n"
             "        }\n"
@@ -2828,15 +2880,14 @@ fn finish_activity(app: &AndroidApp) {
     }));
 }
 
-/// Ask the Activity whether this is a phone-class (small) screen, so the first launch can raise the
-/// app's UI scale to 150% for phones while tablets are left at their own sizing. Returns `None`
-/// when the answer cannot be read, in which case the caller leaves the UI scale alone.
+/// Ask the Activity whether the screen is dense enough (>600 dpi) to give the app its own UI scale
+/// instead of the system's. Returns `None` when the answer cannot be read, in which case the caller
+/// leaves the UI scale alone.
 ///
-/// The decision is Android's own form-factor test (`smallestScreenWidthDp < 600`, the `sw600dp`
-/// boundary): it is the shortest screen edge in dp, so it is stable across rotation, and it
-/// describes screen size rather than density. Called once, on the Java main thread, using the same
+/// The Activity reads the screen's `densityDpi`; the test and its rationale live in
+/// `SafActivity.isHighDensityDevice`. Called once, on the Java main thread, using the same
 /// activity-via-JNI pattern as the fullscreen and bar-appearance helpers above.
-fn device_is_phone(app: &AndroidApp) -> Option<bool> {
+fn device_is_high_density(app: &AndroidApp) -> Option<bool> {
     // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
     let jvm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut _) };
     let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
@@ -2844,13 +2895,13 @@ fn device_is_phone(app: &AndroidApp) -> Option<bool> {
         // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows it.
         let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
         Ok(env
-            .call_method(&*activity, jni_str!("isPhoneDevice"), jni_sig!("()Z"), &[])?
+            .call_method(&*activity, jni_str!("isHighDensityDevice"), jni_sig!("()Z"), &[])?
             .z()?)
     });
     match result {
-        Ok(is_phone) => Some(is_phone),
+        Ok(is_dense) => Some(is_dense),
         Err(error) => {
-            log::warn!("Could not determine the screen class: {error}");
+            log::warn!("Could not determine the screen density: {error}");
             None
         }
     }

@@ -59,8 +59,17 @@
   and its inset is a *consuming* one: the system hands it to the app instead of applying it to the
   content, so edge to edge the app's interface was drawn under that title bar and the first row of
   it was hidden behind it. The content view is now padded by the title bar's height, which moves
-  the native surface (and the interface on it) below it. The padding is applied again when the
-  window takes focus, because only then are the insets known.
+  the native surface (and the interface on it) below it.
+- A black bar along the top of a desktop window, which stayed there after the window was dragged
+  back to normal. The padding that keeps the interface below the title bar above was read once —
+  when the window took focus — and cached, but the platform reports that inset unreliably while a
+  window is being resized: it hardcodes the height to the full frame during a drag
+  (`InsetsSource.calculateInsets`) and only serves the caption source to *floating* windows
+  (`InsetsPolicy`), so a window that had been floating kept being handed the old height after it
+  was returned to fullscreen. The cached padding therefore stuck, and the strip it reserved showed
+  the theme's black window background. The padding is driven by the window's own inset *dispatches*
+  now, so it is recomputed in both directions, and the reserved strip is painted in the app's own
+  theme colour, so even the one frame the system takes to settle is invisible.
 - The two-finger pan scrolled the document the wrong way round. The content follows the fingers, but
   the backend reported the movement of the two fingers' midpoint with the opposite sign, so a slide
   up moved the document down.

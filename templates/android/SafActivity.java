@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.graphics.Rect;
 import android.graphics.pdf.PdfRenderer;
 import android.net.Uri;
 import android.os.Build;
@@ -24,8 +25,10 @@ import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.DragEvent;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -79,6 +82,20 @@ public final class __CLASS__ extends GameActivity {
     private final Map<Integer, Long> requestIds = new HashMap<>();
     private final Map<Long, String> suggestedNames = new HashMap<>();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+
+    // The caption-bar (desktop window title bar) height the content view is padded by, so an
+    // inset dispatch that finds the same height leaves the view — and its layout — alone.
+    private int captionBarPadding = -1;
+    // The app's active theme, told to us by the Rust shell through setBarIconAppearance. The
+    // padding above the canvas shows this colour, so it has to follow the theme: a light app
+    // that reserved the space with the theme's black window background would wear a black bar
+    // (see applyCaptionBarInsets).
+    private boolean lightTheme = false;
+    // A second inset observer (the keyboard patch's, see lib/ime.sh) that has to see every
+    // dispatch too. Kept here because the platform has no public getter for a view's current
+    // insets listener, so it cannot be chained up after the fact — the patch registers through
+    // chainWindowInsetsListener instead.
+    private View.OnApplyWindowInsetsListener chainedInsetsListener;
 
     // Soft-keyboard host. GameActivity, like the NativeActivity it replaces, has no editable
     // view for the system IME (InputMethodManager.showSoftInput on the decor view) so the
@@ -149,19 +166,21 @@ public final class __CLASS__ extends GameActivity {
     public String safFilesDir() { return appStorageDir().getAbsolutePath(); }
 
     /**
-     * True when the device is a phone-class (small) screen, so the first launch can raise the app's
-     * UI scale to a comfortable 150% for it. This is Android's own form-factor test:
-     * {@code smallestScreenWidthDp} is the *shortest* screen edge in density-independent pixels (so
-     * it does not flip with rotation), and 600dp is the same {@code sw600dp} boundary the platform
-     * and Play Store use to bucket tablets. Density ("dpi") is deliberately not used — it describes
-     * pixel size, not screen size. Called once by the Rust shell over JNI.
+     * True when the screen is dense enough for the launch to give the app its own UI scale instead
+     * of the system's. Above 600 dpi the app's own points are drawn so small that its interface is
+     * hard to read, so it is scaled up; at or below that threshold — tablets in particular — the
+     * app is left at Auto, the display scale Android reports.
+     *
+     * The test is {@link DisplayMetrics#densityDpi}, the screen's density as Android reports it
+     * (160 dpi is the baseline where one dp is one pixel), including the user's Display Size
+     * setting, because that is the density the app is actually drawn at.
      */
-    public boolean isPhoneDevice() {
+    public boolean isHighDensityDevice() {
         try {
-            return getResources().getConfiguration().smallestScreenWidthDp < 600;
+            return getResources().getDisplayMetrics().densityDpi > 600;
         } catch (Throwable error) {
-            Log.w(TAG, "Could not read the screen size; assuming a phone", error);
-            return true;
+            Log.w(TAG, "Could not read the screen density; leaving the UI scale at Auto", error);
+            return false;
         }
     }
 
@@ -279,33 +298,105 @@ public final class __CLASS__ extends GameActivity {
      * Keep the interface below the window's own title bar.
      *
      * A desktop window (Samsung DeX and the other freeform modes) carries a title bar of its
-     * own, which the system draws over the top of the window. Its inset is a *consuming* one:
-     * the system hands it to the app instead of applying it to the content, so edge to edge the
-     * top of the interface is drawn under the title bar and is cut off. The content view is
-     * padded by the title bar's height, which moves the native surface (and the interface on it)
-     * with it.
+     * own, which the system draws *over* the top of the window. Its inset is a consuming one —
+     * with edge to edge the system hands it to the app instead of applying it — so the top of
+     * the interface is drawn under the title bar unless the app reserves that height itself. The
+     * content view is therefore padded by the title bar's height, moving the native surface (and
+     * the interface on it) down with it.
      *
-     * The insets are only known once the window has been laid out, so this is applied again when
-     * the window takes focus.
+     * Two things make that padding misbehave if it is read once and cached, as it first was:
+     * the platform hardcodes the caption inset to the full frame height *while a window is being
+     * dragged*, and it only serves the caption source to *floating* windows, so a window that was
+     * floating keeps being handed the old height for a while after it is returned to fullscreen.
+     * A cached value therefore sticks, and the reserved strip — showing the theme's black window
+     * background — is what a user sees as a black bar along the top that survives the resize.
+     *
+     * So the padding is driven by the inset *dispatch* instead (see installCaptionBarInsets): it
+     * is recomputed for every dispatch, in both directions. The strip itself is painted in the
+     * app's own theme colour, so even the one frame the system takes to settle is invisible.
      */
-    private void applyCaptionBarPadding() {
+    private void applyCaptionBarInsets(WindowInsets insets) {
         try {
-            View decor = getWindow() != null ? getWindow().getDecorView() : null;
-            View content = decor != null ? decor.findViewById(android.R.id.content) : null;
+            Window window = getWindow();
+            View content = window != null
+                    ? window.getDecorView().findViewById(android.R.id.content) : null;
             if (content == null) {
                 return;
             }
             int top = 0;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.view.WindowInsets root = decor.getRootWindowInsets();
-                if (root != null) {
-                    top = root.getInsets(WindowInsets.Type.captionBar()).top;
-                }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && insets != null) {
+                top = insets.getInsets(WindowInsets.Type.captionBar()).top;
             }
+            if (top == captionBarPadding) {
+                return;
+            }
+            captionBarPadding = top;
+            // The reserved strip is part of the window, not the canvas: give it the app's theme
+            // colour so it reads as the interface rather than as a gap. Transparent when there is
+            // nothing to reserve.
+            content.setBackgroundColor(top > 0 ? (lightTheme ? 0xFFF5F5F5 : 0xFF1E1E1E) : 0x00000000);
             content.setPadding(0, top, 0, 0);
         } catch (Throwable error) {
             Log.i(TAG, "Could not inset the interface below the window's title bar", error);
         }
+    }
+
+    /**
+     * Drive {@link #applyCaptionBarInsets} from the window's own inset dispatches: every resize,
+     * windowing-mode change and title-bar transition re-runs it, so the reserved height always
+     * matches the window's current title bar. The insets are passed through unconsumed — the
+     * native canvas reads the window size from its surface, and consuming them here would hide
+     * the keyboard inset from the rest of the shell.
+     *
+     * The app's keyboard patch (see lib/ime.sh) needs to see the same dispatches. It registers
+     * through {@link #chainWindowInsetsListener}, and this listener forwards to it, because the
+     * platform offers no public way to read and wrap a view's existing insets listener.
+     */
+    private void installCaptionBarInsets() {
+        try {
+            Window window = getWindow();
+            if (window == null) {
+                return;
+            }
+            View decor = window.getDecorView();
+            decor.setOnApplyWindowInsetsListener((view, insets) -> {
+                applyCaptionBarInsets(insets);
+                View.OnApplyWindowInsetsListener next = chainedInsetsListener;
+                return next != null ? next.onApplyWindowInsets(view, insets) : insets;
+            });
+            // Ask for a first dispatch: the listener above fires as soon as the window has been
+            // laid out, which is the first moment its insets are known.
+            decor.requestApplyInsets();
+        } catch (Throwable error) {
+            Log.i(TAG, "Could not watch the window's title-bar insets", error);
+        }
+    }
+
+    /**
+     * Register an extra inset observer alongside the caption-bar one. The platform has no public
+     * getter for a view's insets listener, so a second observer cannot be chained by reading the
+     * first; it is handed in here and forwarded to on every dispatch instead. Used by the keyboard
+     * patch (lib/ime.sh) to watch the IME insets.
+     */
+    public void chainWindowInsetsListener(View.OnApplyWindowInsetsListener listener) {
+        chainedInsetsListener = listener;
+    }
+
+    /**
+     * Re-assert the window's edge-to-edge layout after it changed shape. A freeform/desktop
+     * window is resized without the Activity being recreated (this Activity asks the system to
+     * keep it across `screenSize`/`smallestScreenSize` changes), and a resize can bring the
+     * system bars back.
+     */
+    private void refreshWindowInsets() {
+        applyEdgeToEdge();
+        applyImmersiveFullscreen();
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        refreshWindowInsets();
     }
 
     /**
@@ -317,6 +408,16 @@ public final class __CLASS__ extends GameActivity {
     public void setBarIconAppearance(boolean lightTheme) {
         runOnUiThread(() -> {
             try {
+                // Remembered for the caption-bar strip: the padding above the canvas is painted in
+                // the app's theme colour, so it has to flip with the theme too.
+                this.lightTheme = lightTheme;
+                if (captionBarPadding > 0) {
+                    View content = getWindow() != null
+                            ? getWindow().getDecorView().findViewById(android.R.id.content) : null;
+                    if (content != null) {
+                        content.setBackgroundColor(lightTheme ? 0xFFF5F5F5 : 0xFF1E1E1E);
+                    }
+                }
                 Window window = getWindow();
                 if (window == null) {
                     return;
@@ -376,6 +477,10 @@ public final class __CLASS__ extends GameActivity {
         if (window != null) {
             window.getDecorView().post(this::applyImmersiveFullscreen);
         }
+        // Keep the interface below a desktop window's title bar, driven by the window's own inset
+        // dispatches so a resize, a windowing-mode change or a title bar coming and going all
+        // land (see applyCaptionBarInsets).
+        installCaptionBarInsets();
         suppressSelectionHandles();
         installDropTarget();
         imeSetup();
@@ -421,12 +526,14 @@ public final class __CLASS__ extends GameActivity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
-            // Repeated now that the window has been laid out: only then are its insets known,
-            // and with them the title bar of a desktop window, which the interface has to stay
-            // below.
-            applyEdgeToEdge();
-            applyCaptionBarPadding();
-            applyImmersiveFullscreen();
+            // Re-assert the bars and ask for a fresh inset dispatch: taking focus is the first
+            // moment a desktop window's title bar is known, and it can change without a layout
+            // pass while the window is dragged.
+            refreshWindowInsets();
+            View decor = getWindow() != null ? getWindow().getDecorView() : null;
+            if (decor != null) {
+                decor.requestApplyInsets();
+            }
         }
     }
 
@@ -812,6 +919,12 @@ public final class __CLASS__ extends GameActivity {
             try {
                 String name = displayName(uri);
                 if (name == null || name.trim().isEmpty()) name = suggestedNames.getOrDefault(id, "untitled");
+                // DocumentsUI lets the user shorten the name to one without an extension even though
+                // the app asked to save `Book.xlsx`. The app then appends an extension of its own and
+                // writes `Book.xlsx` while the staged copy watched for the commit is `Book` — the
+                // chosen document stayed 0 B. Keep the extension the app asked to save as, so the
+                // staged path is the path the app writes.
+                name = keepSuggestedExtension(name, suggestedNames.get(id));
                 File stage = newStageFile(name, uri);
                 rememberUri(stage, uri);
                 enqueueSave(id, stage.getAbsolutePath());
@@ -853,10 +966,18 @@ public final class __CLASS__ extends GameActivity {
         });
     }
 
-    /** Commit an app-private staged file to its remembered SAF URI; used by Rust after every save. */
+    /**
+     * Commit an app-private staged file to its remembered SAF URI; used by Rust after every save.
+     *
+     * <p>The app may write a sibling of the staged path it was handed — GridCraft appends or
+     * replaces the extension after the picker returns, so "Book" becomes "Book.xlsx". The exact
+     * path has no mapping then; fall back to the staged path in the same folder with the same
+     * stem, which is what the user actually chose.
+     */
     public String safCommit(String path) {
         try {
             String uriText = getSharedPreferences(PREFS, MODE_PRIVATE).getString("uri:" + path, null);
+            if (uriText == null) uriText = uriForSibling(path);
             if (uriText == null) return "NONE";
             Uri uri = Uri.parse(uriText);
             OutputStream out = getContentResolver().openOutputStream(uri, "wt");
@@ -873,6 +994,47 @@ public final class __CLASS__ extends GameActivity {
             Log.e(TAG, "Could not write a selected document", e);
             return "ERROR: Could not write the selected document: " + e.getMessage();
         }
+    }
+
+    /** The staged path's stem, ignoring any extension: {@code …/media/Book.xlsx} → {@code …/media/Book}. */
+    private static String stagedStem(String path) {
+        File file = new File(path);
+        String name = file.getName();
+        int dot = name.lastIndexOf('.');
+        String stem = dot > 0 ? name.substring(0, dot) : name;
+        File parent = file.getParentFile();
+        return parent == null ? stem : new File(parent, stem).getAbsolutePath();
+    }
+
+    /** The remembered URI of a staged path whose extension the app rewrote, if there is one. */
+    private String uriForSibling(String path) {
+        String stem = stagedStem(path);
+        try {
+            for (Map.Entry<String, ?> entry : getSharedPreferences(PREFS, MODE_PRIVATE).getAll().entrySet()) {
+                if (!entry.getKey().startsWith("uri:") || !(entry.getValue() instanceof String uriText)) continue;
+                String staged = entry.getKey().substring("uri:".length());
+                if (stagedStem(staged).equals(stem)) return uriText;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not look up a staged document", e);
+        }
+        return null;
+    }
+
+    /**
+     * Give a name the user shortened back the extension the app asked to save as. Android's save
+     * dialog lets a name be saved with no extension; the app then adds its own (say ".xlsx") and
+     * writes a different staged file than the one watched for the commit, leaving the document the
+     * user chose empty.
+     */
+    private static String keepSuggestedExtension(String name, String suggested) {
+        if (name == null || suggested == null) return name;
+        int dot = name.lastIndexOf('.');
+        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (dot > slash + 1 && dot < name.length() - 1) return name;
+        int suggestedDot = suggested.lastIndexOf('.');
+        if (suggestedDot <= 0 || suggestedDot >= suggested.length() - 1) return name;
+        return name + suggested.substring(suggestedDot);
     }
 
     /**

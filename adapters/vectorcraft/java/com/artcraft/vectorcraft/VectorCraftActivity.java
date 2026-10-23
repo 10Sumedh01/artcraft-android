@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -14,8 +15,10 @@ import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.DragEvent;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -150,19 +153,21 @@ public final class VectorCraftActivity extends GameActivity {
     }
 
     /**
-     * True when the device is a phone-class (small) screen, so the first launch can raise the app's
-     * UI scale to a comfortable 150% for it. This is Android's own form-factor test:
-     * {@code smallestScreenWidthDp} is the *shortest* screen edge in density-independent pixels (so
-     * it does not flip with rotation), and 600dp is the same {@code sw600dp} boundary the platform
-     * and Play Store use to bucket tablets. Density ("dpi") is deliberately not used — it describes
-     * pixel size, not screen size. Called once by the Rust shell over JNI.
+     * True when the screen is dense enough that the launch should give the app its own UI scale
+     * instead of the system's. Above 600 dpi the app's own points are drawn so small that its
+     * interface is hard to read, so it is scaled up; at or below that threshold — tablets in
+     * particular — the app is left at Auto, the display scale Android reports.
+     *
+     * The test is {@link DisplayMetrics#densityDpi}, the screen's density as Android reports it
+     * (160 dpi is the baseline where one dp is one pixel), including the user's Display Size
+     * setting, because that is the density the app is actually drawn at.
      */
-    public boolean isPhoneDevice() {
+    public boolean isHighDensityDevice() {
         try {
-            return getResources().getConfiguration().smallestScreenWidthDp < 600;
+            return getResources().getDisplayMetrics().densityDpi > 600;
         } catch (Throwable error) {
-            Log.w(TAG, "Could not read the screen size; assuming a phone", error);
-            return true;
+            Log.w(TAG, "Could not read the screen density; leaving the UI scale at Auto", error);
+            return false;
         }
     }
 

@@ -467,38 +467,94 @@ mod saf {
     /// and pushes it to the destination URI whenever it changes on disk. Used by hosts whose file
     /// API is path-based (the app writes the file without a write hook to intercept). The file
     /// stays in app-private storage, so later saves to the same path sync too.
+    ///
+    /// A path-based app may not write the exact staged path it was handed: it can add or replace
+    /// the extension after the pick (GridCraft saves "Book" as "Book.xlsx"). The whole family of
+    /// files sharing the staged file's stem is watched, so that write is committed too — the Java
+    /// side resolves such a sibling back to the chosen document. Files already there when the pick
+    /// happened are remembered, so they are never pushed into a new document.
     #[derive(Default)]
     pub struct SaveMirror {
-        entries: Mutex<HashMap<u64, (String, u64, u64)>>,
+        entries: Mutex<HashMap<u64, Tracked>>,
     }
+
+    #[derive(Default)]
+    struct Tracked {
+        path: String,
+        /// Last-known stamp of every staged path already seen for this pick.
+        stamps: HashMap<String, (u64, u64)>,
+        /// When the stem family was last listed. Listing every frame would read the whole staged
+        /// directory 60 times a second; a sibling written by the app is still found within a frame
+        /// or two.
+        scanned: Option<Instant>,
+    }
+
+    /// How often the staged directory is listed for new files sharing the tracked stem.
+    const SCAN_INTERVAL: Duration = Duration::from_millis(200);
 
     impl SaveMirror {
         /// Watch `path` (a staged save destination) for writes.
         pub fn track(&self, id: u64, path: &str) {
-            let (mtime, size) = file_stamp(path);
+            let mut tracked = Tracked { path: path.to_owned(), ..Tracked::default() };
+            for candidate in family(path) {
+                tracked.stamps.insert(candidate.clone(), file_stamp(&candidate));
+            }
+            tracked.scanned = Some(Instant::now());
             self.entries
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .insert(id, (path.to_owned(), mtime, size));
+                .insert(id, tracked);
         }
 
         /// Commit every tracked file whose contents changed since the last sync.
         pub fn sync(&self, bridge: &Bridge) {
             let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
-            for (_id, (path, mtime, size)) in entries.iter_mut() {
-                let (now_mtime, now_size) = file_stamp(path);
-                if (now_mtime, now_size) == (*mtime, *size) {
-                    continue;
+            for tracked in entries.values_mut() {
+                if tracked.scanned.is_none_or(|at| at.elapsed() >= SCAN_INTERVAL) {
+                    for candidate in family(&tracked.path) {
+                        tracked.stamps.entry(candidate.clone()).or_insert_with(|| file_stamp(&candidate));
+                    }
+                    tracked.scanned = Some(Instant::now());
                 }
-                *mtime = now_mtime;
-                *size = now_size;
-                match bridge.commit(path) {
-                    Ok(status) if status == "NONE" || status == "OK" => {}
-                    Ok(status) => log::error!("Could not save {path}: {status}"),
-                    Err(error) => log::error!("Could not save {path}: {error}"),
+                let candidates: Vec<String> = tracked.stamps.keys().cloned().collect();
+                for candidate in candidates {
+                    let stamp = file_stamp(&candidate);
+                    if tracked.stamps.get(&candidate) == Some(&stamp) {
+                        continue;
+                    }
+                    tracked.stamps.insert(candidate.clone(), stamp);
+                    // An empty file is the staged copy the picker itself just created, not a write.
+                    if stamp.1 == 0 {
+                        continue;
+                    }
+                    match bridge.commit(&candidate) {
+                        Ok(status) if status == "NONE" || status == "OK" => {}
+                        Ok(status) => log::error!("Could not save {candidate}: {status}"),
+                        Err(error) => log::error!("Could not save {candidate}: {error}"),
+                    }
                 }
             }
         }
+    }
+
+    /// The staged path plus any file beside it with the same stem ("Book.xlsx", "Book.csv", …).
+    fn family(path: &str) -> Vec<String> {
+        let mut paths = vec![path.to_owned()];
+        let staged = std::path::Path::new(path);
+        let (Some(parent), Some(stem)) = (staged.parent(), staged.file_stem()) else {
+            return paths;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else { return paths };
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate.file_stem().is_some_and(|other| other == stem)
+                && let Some(candidate) = candidate.to_str()
+                && candidate != path
+            {
+                paths.push(candidate.to_owned());
+            }
+        }
+        paths
     }
 
     fn file_stamp(path: &str) -> (u64, u64) {
