@@ -58,6 +58,7 @@ jobs:
           - deckcraft
           - cadcraft
           - gridcraft
+          - subcraft
 
     steps:
       - name: Checkout repository

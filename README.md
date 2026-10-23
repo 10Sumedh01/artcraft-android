@@ -23,6 +23,7 @@ Replace `-pdfcraft` with any supported app name.
 ```text
 photocraft vectorcraft filmcraft lightcraft pdfcraft effectcraft
 designcraft figcraft wordcraft soundcraft deckcraft cadcraft gridcraft
+subcraft
 ```
 
 App names are passed as command-line flags, such as `-photocraft` or `-vectorcraft`.

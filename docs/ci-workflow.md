@@ -147,10 +147,11 @@ strategy:
       - deckcraft
       - cadcraft
       - gridcraft
+      - subcraft
 ```
 
 ### Why `fail-fast: false` is Critical
-If upstream changes in one app (e.g. `soundcraft`) cause a compilation failure, `fail-fast: false` ensures the remaining 12 apps continue building without being prematurely cancelled.
+If upstream changes in one app cause a compilation failure, `fail-fast: false` ensures the remaining apps continue building without being prematurely cancelled.
 
 ### Source Resolution (Stable Releases vs. Main)
 The step passes `BUILD_SOURCE: ${{ inputs.source_version || 'stable' }}` to `build.sh`:
