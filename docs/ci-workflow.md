@@ -200,3 +200,98 @@ bundle:
 2. **Reproducible builds:** Stable tag targeting guarantees deterministic builds identical to upstream releases.
 3. **Resilient matrix:** Individual failures do not disrupt the rest of the suite.
 4. **Traceable debugging:** Full logs are captured and preserved as artifacts on failure.
+
+---
+
+## 9. Adding New Android Ports to the Build System & CI
+
+To introduce a new app into ArtCraft Android (such as a newly released Craft app like `AniCraft`, or a standalone external Rust project), follow these steps:
+
+### Step 1: Register the App in `lib/build-common.sh`
+
+1. **App Title & Repository Definition:**
+   Locate the app resolution `case "$APP" in` block (~line 123):
+   ```bash
+   case "$APP" in
+       photocraft) TITLE="PhotoCraft" ;;
+       ...
+       cadcraft) TITLE="CADCraft" ;;
+       gridcraft) TITLE="GridCraft" ;;
+       # Add new app here:
+       myapp)
+           TITLE="MyApp"
+           # If the app is external (not under storytold/), override REPO:
+           # REPO="https://github.com/my-org/myapp.git"
+           ;;
+       *) echo "Unsupported app: $APP" >&2; usage; exit 2 ;;
+   esac
+   ```
+
+2. **Verify Git Origin Safety Check:**
+   Ensure the origin check (~line 450) validates against `${REPO%.git}`:
+   ```bash
+   case "${ORIGIN%.git}" in
+       "${REPO%.git}") ;;
+       *) fail "$SRC has unexpected origin '$ORIGIN'; refusing to reuse or overwrite it." ;;
+   esac
+   ```
+
+3. **Add the CLI Flag to `usage()`:**
+   Add `-myapp` to the `App names:` list in `usage()` (~line 24) so it appears in `--help`.
+
+---
+
+### Step 2: Android Port Adapter (`adapters/<app>/` or Auto-Generator)
+
+ArtCraft Android supports two porting models:
+
+* **Model A: Automatic Generator (Zero Code):**
+  If the application is a standard Rust `egui`/`eframe` workspace (similar to the Craft suite), `build-common.sh`'s built-in generator (`generate_android_launcher()`) automatically inspects the workspace, creates `apps/<app>-android`, synthesizes JNI entrypoints (`android_main`), and sets up Gradle build scripts.
+* **Model B: Custom Adapter (`adapters/<app>/`):**
+  If the app requires custom window loops, JNI bridges, Android Storage Access Framework (SAF) file pickers, or specific C library bindings:
+  1. Create directory `adapters/<app>/`
+  2. Provide:
+     - `adapters/<app>/Cargo.toml`: Declares `crate-type = ["cdylib"]` and `[package.metadata.android]`.
+     - `adapters/<app>/src/lib.rs`: Exports `#[no_mangle] pub fn android_main(app: AndroidApp)`.
+     - `adapters/<app>/java/` (optional): Custom `NativeActivity` Java subclass for Android SAF/lifecycle handling.
+     - `adapters/<app>/res/`: Drawables, styles, and layouts.
+
+  The build script automatically detects `adapters/<app>` and copies it into the app workspace prior to compilation.
+
+---
+
+### Step 3: Add to the GitHub Actions CI Matrix (`.github/workflows/build.yml`)
+
+Add the new app identifier to the `matrix.app` list in `.github/workflows/build.yml`:
+
+```yaml
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - photocraft
+          - vectorcraft
+          ...
+          - gridcraft
+          - myapp   # <-- Add here
+```
+
+**What happens automatically in CI:**
+- The runner automatically executes `bash build.sh -myapp`.
+- Caching (`sccache`, Cargo registry, Gradle) is dynamically isolated and namespaced to `myapp`.
+- The built APK is verified for minimum size and zip integrity.
+- Artifacts are uploaded as `myapp-apk` and bundled into `artcraft-all-apks` and GitHub Releases.
+
+---
+
+### Step 4: Test Locally & Document
+
+1. Test the local release build:
+   ```bash
+   bash build.sh -myapp
+   ```
+2. Verify the generated APK in `output/`:
+   ```bash
+   unzip -tq output/myapp-*.apk
+   ```
+3. Update `README.md` to list the new app under **Supported apps**.
