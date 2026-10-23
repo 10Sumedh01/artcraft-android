@@ -23,12 +23,16 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
     name: Build ${{ matrix.app }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     strategy:
       fail-fast: false
       matrix:
