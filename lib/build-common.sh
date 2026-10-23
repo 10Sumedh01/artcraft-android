@@ -514,9 +514,11 @@ if app == "photocraft":
 elif app == "soundcraft":
     # Dependabot bumped symphonia to 0.6.1 in 52471b3, breaking soundcraft-audio-io
     # (symphonia 0.6 removed SampleBuffer and changed codec parameters).
-    # It also bumped egui/eframe to 0.37 which conflicts with vendored egui-winit 0.36.
+    # It also bumped cpal to 0.18 (breaking soundcraft-playback sample rate APIs)
+    # and egui/eframe to 0.37 (conflicting with vendored egui-winit 0.36).
     for rel, old, new in [
         ("Cargo.toml", 'symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }', 'symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }'),
+        ("Cargo.toml", 'cpal = "0.18"', 'cpal = "0.16"'),
         ("Cargo.toml", 'egui = "0.37"', 'egui = "0.36"'),
         ("Cargo.toml", 'egui_kittest = "0.37"', 'egui_kittest = "0.36"'),
         ("Cargo.toml", 'eframe = { version = "0.37", default-features = false }', 'eframe = { version = "0.36", default-features = false }'),
