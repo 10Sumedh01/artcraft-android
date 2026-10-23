@@ -8,26 +8,6 @@ on:
       - '**'
   workflow_dispatch:
     inputs:
-      app:
-        description: 'App to build (or "all")'
-        required: false
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - photocraft
-          - vectorcraft
-          - filmcraft
-          - lightcraft
-          - pdfcraft
-          - effectcraft
-          - designcraft
-          - figcraft
-          - wordcraft
-          - soundcraft
-          - deckcraft
-          - cadcraft
-          - gridcraft
       mode:
         description: 'Build mode'
         required: false
@@ -48,7 +28,6 @@ jobs:
   build:
     name: Build ${{ matrix.app }}
     runs-on: ubuntu-latest
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.app == 'all' || github.event.inputs.app == matrix.app
     strategy:
       fail-fast: false
       matrix:
@@ -118,7 +97,7 @@ jobs:
 
       - name: Build ${{ matrix.app }} APK
         env:
-          BUILD_MODE: ${{ github.event.inputs.mode || 'release' }}
+          BUILD_MODE: ${{ inputs.mode || 'release' }}
         run: |
           if [ "$BUILD_MODE" = "debug" ]; then
             bash build-debug.sh -${{ matrix.app }}
