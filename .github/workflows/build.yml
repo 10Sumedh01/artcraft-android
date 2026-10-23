@@ -55,11 +55,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Python dependencies & ImageMagick
+      - name: Install Python dependencies & tools
         run: |
           pip install pillow
-          if ! command -v convert >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y imagemagick
+          if ! command -v rsvg-convert >/dev/null 2>&1 || ! command -v convert >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y imagemagick librsvg2-bin
           fi
 
       - name: Set up sccache

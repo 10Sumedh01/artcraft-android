@@ -70,26 +70,37 @@ def _magick():
     return shutil.which("magick") or shutil.which("convert")
 
 
+def _rsvg():
+    import shutil
+
+    return shutil.which("rsvg-convert")
+
+
 def pick_source(src: Path, app: str, explicit: Path = None) -> Path:
     """The artwork the icon is built from: an explicit -appicon, else the app's own
-    vector source (crisp at every size), else its largest own PNG."""
+    largest master PNG (crisp 1024x1024 / 512x512), else its vector source."""
     if explicit:
         if not explicit.is_file():
             raise SystemExit(f"App icon not found: {explicit}")
         return explicit
     icon_dir = src / "assets" / "app-icon"
     if icon_dir.is_dir():
-        # Prefer `<app>.svg`, then a generically named vector, then anything else the app
-        # ships that is not the reduced "-small" variant.
+        # Prefer the app's own high-res PNG (master 1024x1024 or 512x512). These are
+        # pristine renders produced for distribution. Using them directly avoids
+        # ImageMagick MSVG clipPath bugs and huge memory allocation.
+        pngs = [p for p in icon_dir.rglob("*.png") if app in p.name.lower()]
+        high_res = [p for p in pngs if "1024" in p.name or "512" in p.name]
+        if high_res:
+            return max(high_res, key=lambda p: p.stat().st_size)
+        # Vector sources if no high-res PNG is available
         svgs = [icon_dir / f"{app}.svg", icon_dir / "icon.svg"]
         svgs += sorted(p for p in icon_dir.glob("*.svg") if "-small" not in p.stem)
-        rasterizer = _magick()
+        rasterizer = _rsvg() or _magick()
         if rasterizer:
             for svg in svgs:
                 if svg.is_file():
                     return svg
-        # Own PNGs only — never another ArtCraft app's branding — largest first.
-        pngs = [p for p in icon_dir.rglob("*.png") if app in p.name.lower()]
+        # Any other own PNGs
         if pngs:
             return max(pngs, key=lambda p: p.stat().st_size)
     raise SystemExit(
@@ -102,24 +113,31 @@ def _raster(source: Path):
     """The icon as a WORK_PX RGBA raster, plus the un-flooded original for legacy sizes."""
     Image, _ = _pillow()
     work = Image.new("RGBA", (WORK_PX, WORK_PX))
-    magick = _magick()
     if source.suffix.lower() == ".svg":
-        if not magick:
-            raise SystemExit(f"Rasterising {source.name} needs ImageMagick.")
+        rsvg = _rsvg()
+        magick = _magick()
+        if not rsvg and not magick:
+            raise SystemExit(f"Rasterising {source.name} needs rsvg-convert or ImageMagick.")
         import subprocess
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "raster.png"
-            subprocess.run(
-                # `-background none` first, or ImageMagick flattens the SVG onto an opaque
-                # white canvas: a source drawn inside a clip (a rounded-square tile, like
-                # SoundCraft's) has transparent corners, and those corners then come back
-                # white — which both makes the brand-colour sampling below read white and
-                # leaves white wedges behind the launcher's mask.
-                [magick, "-background", "none", str(source), "-resize", f"{WORK_PX}x{WORK_PX}", str(out)],
-                check=True,
-            )
+            if rsvg:
+                subprocess.run(
+                    [rsvg, "-w", str(WORK_PX), "-h", str(WORK_PX), "-f", "png", "-o", str(out), str(source)],
+                    check=True,
+                )
+            else:
+                subprocess.run(
+                    # `-background none` first, or ImageMagick flattens the SVG onto an opaque
+                    # white canvas: a source drawn inside a clip (a rounded-square tile, like
+                    # SoundCraft's) has transparent corners, and those corners then come back
+                    # white — which both makes the brand-colour sampling below read white and
+                    # leaves white wedges behind the launcher's mask.
+                    [magick, "-background", "none", str(source), "-resize", f"{WORK_PX}x{WORK_PX}", str(out)],
+                    check=True,
+                )
             work = Image.open(out).convert("RGBA")
             work.load()
     else:
@@ -174,6 +192,12 @@ def _strip_background(im, pristine):
     Image, ImageDraw = _pillow()
     from collections import Counter
 
+    # Crop transparent padding if any, so the squircle edges touch WORK_PX
+    box = im.split()[3].getbbox()
+    if box and (box[0] > 0 or box[1] > 0 or box[2] < im.width or box[3] < im.height):
+        im = im.crop(box).resize((WORK_PX, WORK_PX), Image.LANCZOS)
+        pristine = im.copy()
+
     px = im.load()
     # Remember the untouched colours: a pixel must only be cleared when it *was* the
     # background colour, never when the flood bled into the artwork.
@@ -187,24 +211,26 @@ def _strip_background(im, pristine):
     # The background colour to remove: the most common opaque colour on the border. A pixel
     # is only cleared when it matches *that colour*, so a flood that bleeds into the artwork
     # (SoundCraft's bird reaches the bottom and right edges, past its rounded clip) leaves the
-    # artwork alone instead of erasing it.
+    # artwork alone instead of erasing it. Sample slightly inset (offset=2) to avoid 1px
+    # antialiased outer fringes.
+    offset = 2
     border = [
         px[x, y][0:3]
         for y in range(0, WORK_PX, 2)
-        for x in (0, WORK_PX - 1)
-        if px[x, y][3] > 200
+        for x in (offset, WORK_PX - 1 - offset)
+        if px[x, y][3] > 150
     ] + [
         px[x, y][0:3]
         for x in range(0, WORK_PX, 2)
-        for y in (0, WORK_PX - 1)
-        if px[x, y][3] > 200
+        for y in (offset, WORK_PX - 1 - offset)
+        if px[x, y][3] > 150
     ]
     if not border:
         return pristine, False
     (br, bg, bb), _n = Counter(border).most_common(1)[0]
 
     def is_background(p) -> bool:
-        return p[3] > 200 and abs(p[0] - br) + abs(p[1] - bg) + abs(p[2] - bb) <= FLOOD_THRESH
+        return p[3] > 100 and abs(p[0] - br) + abs(p[1] - bg) + abs(p[2] - bb) <= FLOOD_THRESH
 
     # Flood a scratch copy and mark what it reached, so near-sentinel antialiasing cannot be
     # mistaken for the sentinel itself.
@@ -217,24 +243,28 @@ def _strip_background(im, pristine):
         (WORK_PX - 1, 0),
         (0, WORK_PX - 1),
         (WORK_PX - 1, WORK_PX - 1),
-        (WORK_PX // 2, 0),
-        (WORK_PX // 2, WORK_PX - 1),
-        (0, WORK_PX // 2),
-        (WORK_PX - 1, WORK_PX // 2),
-        (q, 0),
-        (3 * q, 0),
-        (q, WORK_PX - 1),
-        (3 * q, WORK_PX - 1),
-        (0, q),
-        (0, 3 * q),
-        (WORK_PX - 1, q),
-        (WORK_PX - 1, 3 * q),
+        (offset, offset),
+        (WORK_PX - 1 - offset, offset),
+        (offset, WORK_PX - 1 - offset),
+        (WORK_PX - 1 - offset, WORK_PX - 1 - offset),
+        (WORK_PX // 2, offset),
+        (WORK_PX // 2, WORK_PX - 1 - offset),
+        (offset, WORK_PX // 2),
+        (WORK_PX - 1 - offset, WORK_PX // 2),
+        (q, offset),
+        (3 * q, offset),
+        (q, WORK_PX - 1 - offset),
+        (3 * q, WORK_PX - 1 - offset),
+        (offset, q),
+        (offset, 3 * q),
+        (WORK_PX - 1 - offset, q),
+        (WORK_PX - 1 - offset, 3 * q),
     ]
     for seed in seeds:
         ImageDraw.floodfill(scratch, seed, sentinel, thresh=FLOOD_THRESH)
     for y in range(WORK_PX):
         for x in range(WORK_PX):
-            if spx[x, y] == sentinel and is_background(original[x, y]):
+            if spx[x, y] == sentinel and (is_background(original[x, y]) or original[x, y][3] < 100):
                 px[x, y] = (0, 0, 0, 0)
     after = sum(
         1
@@ -263,25 +293,20 @@ def _foreground(Image, stripped) -> "Image":
 
 
 def _write_legacy(source: Path, work, res_dir: Path) -> None:
-    """The flat density icons file managers and non-adaptive surfaces still read. Same
-    ImageMagick-from-source resizing the builder has always used, with a Pillow fallback."""
+    """The flat density icons file managers and non-adaptive surfaces still read."""
     Image, _ = _pillow()
-    magick = _magick()
-    import subprocess
+    base = work
+    if source.suffix.lower() != ".svg":
+        try:
+            base = Image.open(source).convert("RGBA")
+        except Exception:
+            base = work
 
     for density, size in DENSITIES.items():
         out_dir = res_dir / f"mipmap-{density}"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_png = out_dir / "ic_launcher.png"
-        if magick:
-            subprocess.run(
-                # `-background none`, as in `_raster`: keep a clipped icon's transparent
-                # corners transparent instead of flattening them onto white (SoundCraft).
-                [magick, "-background", "none", str(source), "-resize", f"{size}x{size}", str(out_png)],
-                check=True,
-            )
-        else:
-            work.resize((size, size), Image.LANCZOS).save(out_png)
+        base.resize((size, size), Image.LANCZOS).save(out_png)
 
 
 def generate(src: Path, app: str, res_dir: Path, explicit: Path = None) -> Path:
