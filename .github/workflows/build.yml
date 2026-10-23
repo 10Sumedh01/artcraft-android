@@ -58,7 +58,12 @@ jobs:
       - name: Install Python dependencies & ImageMagick
         run: |
           pip install pillow
-          sudo apt-get update -y && sudo apt-get install -y imagemagick
+          if ! command -v convert >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y imagemagick
+          fi
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -71,10 +76,33 @@ jobs:
           sudo mkdir -p /opt/jdk
           sudo ln -s "$JAVA_HOME" /opt/jdk/temurin-21
 
+      - name: Cache Gradle wrapper & dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ matrix.app }}-${{ hashFiles('lib/build-common.sh') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ matrix.app }}-
+            gradle-${{ runner.os }}-
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      - name: Cache Cargo registry & Git dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ matrix.app }}-${{ hashFiles('lib/build-common.sh') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ matrix.app }}-
+            cargo-registry-${{ runner.os }}-
 
       - name: Install cargo-ndk
         run: |
@@ -103,6 +131,8 @@ jobs:
       - name: Build ${{ matrix.app }} APK
         env:
           BUILD_MODE: ${{ inputs.mode || 'release' }}
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "thin"
           CARGO_PROFILE_RELEASE_DEBUG: "false"
@@ -113,6 +143,7 @@ jobs:
           else
             bash build.sh -${{ matrix.app }}
           fi
+          sccache --show-stats || true
 
       - name: Upload ${{ matrix.app }} APK artifact
         uses: actions/upload-artifact@v4
