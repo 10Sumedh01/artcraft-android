@@ -4000,7 +4000,7 @@ BUILT_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*-unsign
     find "$ANDROID_DIR/android/build/outputs" -type f -name '*.apk' -print >&2 || true
     fail "Gradle reported success but the APK artifact was not found. Log: $ROOT/$LOG"
 }
-cp -f "$BUILT_APK" "$FINAL_APK"
+cp -f "$BUILT_APK" "${FINAL_APK}.tmp" && mv -f "${FINAL_APK}.tmp" "$FINAL_APK"
 
 say 7 "Verifying the Android file bridge in the built APK..."
 verify_android_bridge "$APP" "$BUILT_APK"
