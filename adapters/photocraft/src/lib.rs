@@ -750,29 +750,50 @@ impl eframe::App for PhotoCraftAndroidApp {
     }
 }
 
-/// Ask the Activity whether this is a phone-class (small) screen, so the first launch can raise the
-/// app's UI scale to 150 % for phones while tablets are left at their own sizing. `None` when the
-/// answer cannot be read, in which case the UI scale is left alone. Android's own form-factor test
-/// (`smallestScreenWidthDp < 600`, the `sw600dp` boundary): stable across rotation, and about screen
-/// size rather than density.
+/// Ask the Activity whether the screen is dense enough (>600 dpi) to give the app its own UI scale
+/// instead of the system's. `None` when the answer cannot be read, in which case the UI scale is
+/// left alone. See `SafActivity.isHighDensityDevice`.
 #[cfg(target_os = "android")]
-fn device_is_phone(app: &AndroidApp) -> Option<bool> {
+fn device_is_high_density(app: &AndroidApp) -> Option<bool> {
     // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
     let jvm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut _) };
     let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
     let result = jvm.attach_current_thread(|env| -> jni::errors::Result<bool> {
         let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
         Ok(env
-            .call_method(&*activity, jni_str!("isPhoneDevice"), jni_sig!("()Z"), &[])?
+            .call_method(&*activity, jni_str!("isHighDensityDevice"), jni_sig!("()Z"), &[])?
             .z()?)
     });
     match result {
-        Ok(is_phone) => Some(is_phone),
+        Ok(is_dense) => Some(is_dense),
         Err(error) => {
-            log::warn!("Could not determine the screen class: {error}");
+            log::warn!("Could not determine the screen density: {error}");
             None
         }
     }
+}
+
+/// Whether the high-density UI scale should be applied to this launch, and the sidecar that
+/// remembers that it was.
+///
+/// The scale belongs to the *device*, but `preferences.json` belongs to the *user*: it is written on
+/// the first launch and never revisited, so a screen that later stops being high-density (a
+/// foldable, an external display, a display-size change) kept the old scale. The choice is
+/// remembered in its own sidecar (`device_class`), so "first launch" means "the scale has not been
+/// set for this device yet" and a user who changes the scale by hand keeps it: the sidecar already
+/// says it was applied, so nothing is re-applied.
+#[cfg(target_os = "android")]
+fn device_scale_first_time(dir: &Path) -> bool {
+    let marker = dir.join("device_class");
+    if fs::read_to_string(&marker).ok().is_some_and(|saved| saved.trim() == "scaled") {
+        return false;
+    }
+    let path = dir.join("device_class");
+    let temporary = path.with_extension("tmp");
+    if let Err(error) = fs::create_dir_all(dir).and_then(|()| fs::write(&temporary, b"scaled")).and_then(|()| fs::rename(&temporary, &path)) {
+        log::warn!("settings: {}: {error}", path.display());
+    }
+    true
 }
 
 #[cfg(target_os = "android")]
@@ -841,10 +862,13 @@ fn android_main(android_app: AndroidApp) {
                     app_intent_inbox.clone(),
                 ),
             );
-            // First launch on a phone-class screen: raise the UI scale to 150 % (the app saves it
-            // through `save_prefs` on its normal schedule). Runs only while `preferences.json` does
-            // not exist yet, so a user who changes the scale later keeps their choice.
-            if !prefs_path.exists() && device_is_phone(&app_bridge.app) == Some(true) {
+            // A high-density screen gets the app's 150 % UI scale; every other screen keeps its own
+            // default, Auto. Applied once (`device_scale_first_time`), which covers a first launch
+            // and an upgrade from a build without this bootstrap; a user who sets the scale by hand
+            // keeps it, since the sidecar already says it was applied. The app saves it through
+            // `save_prefs` on its normal schedule.
+            let class_dir = prefs_path.parent().unwrap_or_else(|| Path::new("."));
+            if device_is_high_density(&app_bridge.app) == Some(true) && device_scale_first_time(class_dir) {
                 let _ = app.session.execute("prefs.set", serde_json::json!({"values": {"interface.uiScale": "150"}}));
             }
             // Hand the canvas the live render state when the device is a real GPU, and record the

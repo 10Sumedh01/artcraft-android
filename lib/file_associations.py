@@ -162,6 +162,12 @@ EXT_MIME = {
     "srt": ("application/x-subrip",),
     "vtt": ("text/vtt",),
     "scc": ("application/scc",),
+    # 3D models (SubCraft's project and mesh formats)
+    "subcraft": ("application/x-subcraft",),
+    "obj": ("model/obj",),
+    "gltf": ("model/gltf+json",),
+    "glb": ("model/gltf-binary",),
+    "fbx": ("application/octet-stream",),
 }
 
 # App -> the document extensions it offers to open. Kept to the app's own document formats (a
@@ -200,6 +206,7 @@ ASSOCIATIONS = {
     "figcraft": ["figcraft", "fig"],
     "effectcraft": ["ecproj", "ecprojx", "ectemplate"],
     "cadcraft": ["dwg", "dwt", "dxf"],
+    "subcraft": ["subcraft", "obj", "gltf", "glb", "fbx"],
 }
 
 MAIN_FILTER = '{ actions = ["android.intent.action.MAIN"], categories = ["android.intent.category.LAUNCHER"] }'

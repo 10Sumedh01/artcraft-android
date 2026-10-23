@@ -18,8 +18,8 @@ use std::task::Waker;
 /// Which system picker to show for a request.
 #[derive(Clone, Debug)]
 pub enum Kind {
-    /// One or more files to open.
-    Open,
+    /// One or more files to open. `multiple` allows the picker to return several at once.
+    Open { multiple: bool },
     /// Where to save one file, with the dialog's suggested file name.
     Save(String),
     /// A folder.
@@ -32,6 +32,13 @@ struct Pending {
 }
 
 static LAUNCHER: std::sync::OnceLock<Arc<dyn Fn(u64, Kind) + Send + Sync>> = std::sync::OnceLock::new();
+/// Launcher for the *synchronous* dialog API (`FileDialog::save_file`, `pick_file`, `pick_folder`),
+/// which cannot await a future. The generated/adapted Activity supplies a closure that shows the
+/// picker and waits for its answer before returning. It runs on the Rust main thread, whose
+/// callbacks the SAF bridge makes non-blocking for the duration (see `saf_bridge.rs`), so parking
+/// it does not stall Android's lifecycle handshake.
+static BLOCKING_LAUNCHER: std::sync::OnceLock<Arc<dyn Fn(Kind) -> Option<Vec<PathBuf>> + Send + Sync>> =
+    std::sync::OnceLock::new();
 static PENDING: std::sync::LazyLock<Mutex<HashMap<u64, Pending>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +52,13 @@ fn lock_pending() -> std::sync::MutexGuard<'static, HashMap<u64, Pending>> {
 /// the first install wins.
 pub fn install(launcher: Arc<dyn Fn(u64, Kind) + Send + Sync>) {
     let _ = LAUNCHER.set(launcher);
+}
+
+/// Install the launcher for the synchronous dialog API: it shows the picker for `kind` and returns
+/// the chosen paths (`None` = cancelled) before returning. Used by apps whose file API is the
+/// blocking `rfd::FileDialog` (SubCraft), which has no future to await.
+pub fn install_blocking(launcher: Arc<dyn Fn(Kind) -> Option<Vec<PathBuf>> + Send + Sync>) {
+    let _ = BLOCKING_LAUNCHER.set(launcher);
 }
 
 /// Deliver a picker's answer (`paths`; `None` = cancelled) and wake the waiting future.
@@ -95,4 +109,11 @@ impl std::future::Future for SafFuture {
 pub(crate) async fn pick(kind: Kind) -> Option<Vec<PathBuf>> {
     let id = start(kind)?;
     SafFuture { id }.await
+}
+
+/// The synchronous dialog API's entry point: run the blocking SAF picker for `kind` and return its
+/// paths (`None` when cancelled, or when no blocking launcher is installed — the dialog then
+/// resolves to "cancelled", exactly as the plain stub did).
+pub(crate) fn pick_sync(kind: Kind) -> Option<Vec<PathBuf>> {
+    BLOCKING_LAUNCHER.get().and_then(|launcher| launcher(kind))
 }
