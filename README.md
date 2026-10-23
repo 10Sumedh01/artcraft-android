@@ -31,6 +31,10 @@ App names are passed as command-line flags, such as `-photocraft` or `-vectorcra
 
 | Option | Description |
 | --- | --- |
+| `-stable` | Build against latest stable release tag of the upstream app (default). |
+| `-main`, `-latest` | Build against the rolling upstream `main` branch. |
+| `-tag=<tag>` | Build against a specific git tag (e.g. `-tag=v0.12.1`). |
+| `-branch=<branch>` | Build against a specific git branch. |
 | `-appname=<name>` | Override the Android display name. By default, the app's built-in title is used. |
 | `-packagename=<pkg>` | Override the Android package name. By default, the package is `com.artcraft.<app>`. |
 | `-appicon=<path>` | Use a custom launcher icon PNG. By default, the app's own icon is used. |

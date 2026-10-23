@@ -16,6 +16,10 @@ Required:
   -<app>              App to build (leading hyphen)
 
 Options:
+  -stable             Build against latest stable release tag (default)
+  -main, -latest      Build against upstream main branch
+  -tag=<tag>          Build against a specific git tag
+  -branch=<branch>    Build against a specific git branch
   -appname=<name>     Override the display name (default: app's built-in title)
   -packagename=<pkg>  Override the Android package (default: com.artcraft.<app>)
   -appicon=<path>     Use a custom launcher icon PNG (default: app's own icon)
@@ -50,11 +54,33 @@ fi
 APPNAME=""
 PACKAGENAME=""
 APPICON=""
+BUILD_SOURCE="${BUILD_SOURCE:-stable}"
+RAW_APP=""
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         -h|--help)
             usage
             exit 0
+            ;;
+        -stable)
+            BUILD_SOURCE="stable"
+            shift
+            ;;
+        -main|-latest)
+            BUILD_SOURCE="main"
+            shift
+            ;;
+        -tag=*)
+            BUILD_SOURCE="${1#-tag=}"
+            shift
+            ;;
+        -branch=*)
+            BUILD_SOURCE="${1#-branch=}"
+            shift
+            ;;
+        -source=*)
+            BUILD_SOURCE="${1#-source=}"
+            shift
             ;;
         -appname=*)
             APPNAME="${1#-appname=}"
@@ -69,6 +95,11 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
         -*)
+            if [[ -n "$RAW_APP" ]]; then
+                echo "Multiple app targets specified: $RAW_APP and $1" >&2
+                usage
+                exit 2
+            fi
             RAW_APP="$1"
             shift
             ;;
@@ -449,7 +480,7 @@ if [[ -e "$SRC" ]]; then
         fail "$SRC is an incomplete checkout: some files of the workspace are missing on disk. That happens when a clone is interrupted (a killed build, or a full disk). Move $SRC aside and run the build again to re-clone it."
     fi
     echo "Reusing existing source checkout (including your Android port changes)."
-    echo "Commit: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "Ref/Commit: $(git -C "$SRC" describe --tags --always 2>/dev/null || git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "Source is not automatically reset or updated."
 else
     # The clone goes into a scratch directory first and is only moved into place once the tree
@@ -463,9 +494,32 @@ else
         rm -rf "$SRC_TMP"
         fail "Only $((FREE_BYTES / 1048576)) MiB are free on the disk holding $ROOT/source, but cloning $TITLE needs about 1 GiB. Free some space (build/ holds the Cargo output of every app) and run the build again."
     fi
-    if ! git clone --depth 1 "$REPO" "$SRC_TMP"; then
+
+    TARGET_REF=""
+    if [[ "$BUILD_SOURCE" == "stable" ]]; then
+        echo "Looking up latest stable release tag for $TITLE ($REPO)..."
+        LATEST_TAG="$(git ls-remote --tags --sort=-v:refname "$REPO" 'v*' 2>/dev/null | grep -v '\^{}' | head -n 1 | awk '{print $2}' | sed 's|refs/tags/||' || true)"
+        if [[ -n "$LATEST_TAG" ]]; then
+            TARGET_REF="$LATEST_TAG"
+            echo "  -> Found latest stable release tag: $TARGET_REF"
+        else
+            echo "  -> No 'v*' release tag found; falling back to default branch."
+        fi
+    elif [[ "$BUILD_SOURCE" != "main" && "$BUILD_SOURCE" != "master" && "$BUILD_SOURCE" != "latest" && -n "$BUILD_SOURCE" ]]; then
+        TARGET_REF="$BUILD_SOURCE"
+        echo "Using target ref: $TARGET_REF"
+    else
+        echo "Building against upstream main branch."
+    fi
+
+    CLONE_ARGS=(--depth 1)
+    if [[ -n "$TARGET_REF" ]]; then
+        CLONE_ARGS+=(--branch "$TARGET_REF")
+    fi
+
+    if ! git clone "${CLONE_ARGS[@]}" "$REPO" "$SRC_TMP"; then
         rm -rf "$SRC_TMP"
-        fail "Cloning $REPO failed. Check the network connection and the free disk space, then run the build again."
+        fail "Cloning $REPO (ref: ${TARGET_REF:-default}) failed. Check the network connection and the free disk space, then run the build again."
     fi
     if ! source_tree_is_complete "$SRC_TMP"; then
         rm -rf "$SRC_TMP"
