@@ -511,20 +511,6 @@ if app == "photocraft":
         '            export_presets: take(&mut m, "export_presets"),\n',
     ):
         fixed.append("crates/engine/src/presets/mod.rs")
-elif app == "soundcraft":
-    # Dependabot bumped symphonia to 0.6.1 in 52471b3, breaking soundcraft-audio-io
-    # (symphonia 0.6 removed SampleBuffer and changed codec parameters).
-    # It also bumped cpal to 0.18 (breaking soundcraft-playback sample rate APIs)
-    # and egui/eframe to 0.37 (conflicting with vendored egui-winit 0.36).
-    for rel, old, new in [
-        ("Cargo.toml", 'symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }', 'symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }'),
-        ("Cargo.toml", 'cpal = "0.18"', 'cpal = "0.16"'),
-        ("Cargo.toml", 'egui = "0.37"', 'egui = "0.36"'),
-        ("Cargo.toml", 'egui_kittest = "0.37"', 'egui_kittest = "0.36"'),
-        ("Cargo.toml", 'eframe = { version = "0.37", default-features = false }', 'eframe = { version = "0.36", default-features = false }'),
-    ]:
-        if fix(rel, old, new):
-            fixed.append(f"{rel} ({old} -> {new})")
 elif app == "cadcraft":
     # Upstream Dependabot merged PR #1957 which bumped egui to 0.37, harfrust to 0.14,
     # quick-xml to 0.42, and rstar to 0.13, breaking the codebase against those new APIs.
