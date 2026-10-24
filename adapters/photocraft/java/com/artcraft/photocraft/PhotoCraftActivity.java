@@ -151,9 +151,9 @@ public final class PhotoCraftActivity extends GameActivity {
      */
     public boolean isHighDensityDevice() {
         try {
-            return getResources().getDisplayMetrics().densityDpi > 600;
+            return getResources().getConfiguration().smallestScreenWidthDp < 600;
         } catch (Throwable error) {
-            Log.w(TAG, "Could not read the screen density; leaving the UI scale at Auto", error);
+            Log.w(TAG, "Could not read screen size; leaving UI scale at Auto", error);
             return false;
         }
     }

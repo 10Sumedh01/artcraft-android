@@ -478,9 +478,8 @@ fn persist_read(dir: &Path, name: &str) -> Option<Vec<u8>> {
     fs::read(dir.join(name)).ok()
 }
 
-/// Ask the Activity whether the screen is dense enough (>600 dpi) to give the app its own UI scale
-/// instead of the system's. Returns `None` when the answer cannot be read, in which case the UI
-/// scale is left alone. See `SafActivity.isHighDensityDevice`.
+/// Ask the Activity whether the screen is below 600 dpi (phones) for the launch to apply the
+/// app's own scale. Denser screens stay at Auto. Returns `None` when unreadable.
 fn device_is_high_density(app: &AndroidApp) -> Option<bool> {
     // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
     let jvm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut _) };

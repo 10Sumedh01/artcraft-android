@@ -750,9 +750,7 @@ impl eframe::App for PhotoCraftAndroidApp {
     }
 }
 
-/// Ask the Activity whether the screen is dense enough (>600 dpi) to give the app its own UI scale
-/// instead of the system's. `None` when the answer cannot be read, in which case the UI scale is
-/// left alone. See `SafActivity.isHighDensityDevice`.
+/// Screen below 600 dpi (phones) applies the scale; denser screens stay at Auto.
 #[cfg(target_os = "android")]
 fn device_is_high_density(app: &AndroidApp) -> Option<bool> {
     // SAFETY: AndroidApp owns the live VM pointer for the lifetime of the activity.
