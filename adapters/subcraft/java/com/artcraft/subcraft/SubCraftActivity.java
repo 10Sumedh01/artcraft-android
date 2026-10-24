@@ -166,21 +166,14 @@ public final class SubCraftActivity extends GameActivity {
     public String safFilesDir() { return appStorageDir().getAbsolutePath(); }
 
     /**
-     * True when the screen is dense enough that the launch should give the app its own UI scale
-     * instead of the system's. A dense screen (more than 600 dpi) already draws the system's own
-     * interface very large, so the app's interface scale would otherwise come out oversized; the
-     * screens below that threshold — tablets in particular — are left at Auto, the display scale
-     * Android reports.
-     *
-     * The test is {@link DisplayMetrics#densityDpi}, the screen's density as Android reports it
-     * (160 dpi is the baseline where one dp is one pixel), including the user's Display Size
-     * setting, because that is the density the app is actually drawn at.
+     * True when the screen is small enough (phone) to apply the app's own UI scale;
+     * larger screens (tablets) stay at Auto. Uses smallestScreenWidthDp per Android adaptive guidelines.
      */
     public boolean isHighDensityDevice() {
         try {
-            return getResources().getDisplayMetrics().densityDpi > 600;
+            return getResources().getConfiguration().smallestScreenWidthDp < 600;
         } catch (Throwable error) {
-            Log.w(TAG, "Could not read the screen density; leaving the UI scale at Auto", error);
+            Log.w(TAG, "Could not read screen size; leaving UI scale at Auto", error);
             return false;
         }
     }

@@ -2250,8 +2250,8 @@ PERSIST_RECIPES = {
 # listed here only so the builder's table is complete (its adapter's copy is the one that runs).
 # `@UI@`/`@ENGINE@` are filled in like the recipes above.
 UI_SCALE_BOOTSTRAP = {
-    "effectcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
-    "filmcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "150"}));''',
+    "effectcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "75"}));''',
+    "filmcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "appearance.uiScale", "value": "75"}));''',
     # VectorCraft's scale is a factor (1.0 is the system's own size); 0.75 gives the canvas more room.
     "vectorcraft": '''let _ = inner.session.execute("prefs.set", serde_json::json!({"key": "uiScaling", "value": 0.75}));''',
     # WordCraft's sizes are absolute ("100%" is one screen pixel per point, not the system's scale),
@@ -2259,14 +2259,17 @@ UI_SCALE_BOOTSTRAP = {
     "wordcraft": '''inner.ui.interface_size = @UI@::theme::InterfaceSize::from_percent(150.0).unwrap_or_default();''',
     "designcraft": '''inner.ui.ui_scale = 0.75;''',
     "deckcraft": '''inner.ui.ui_scale = 0.75;''',
-    # SoundCraft's slider tops out at 1.5.
-    "soundcraft": '''inner.ui.ui_scale = 1.5;''',
+    # SoundCraft's slider tops out at 1.5 (set to 0.75 / 75% for mobile).
+    "soundcraft": '''inner.ui.ui_scale = 0.75;''',
     # GridCraft's scale is a percentage (75–200).
     "gridcraft": '''inner.ui.interface_scale = 75;''',
     "pdfcraft": '''inner.ui_scale = @UI@::ui_scale::valid(1.5);''',
     # FigCraft keeps the scale in the engine's preferences, as a factor.
     "figcraft": '''inner.session.prefs.ui_scale = 0.75;''',
     "cadcraft": '''inner.options.interface_scale = 0.75;''',
+    # Mobile apps scaled to 75%.
+    "lightcraft": '''inner.ui.ui_scale = 0.75;''',
+    "subcraft": '''inner.ui.ui_scale = 0.75;''',
 }
 
 # Run once right after `persist_load`, to open a launch on the app's own homepage instead of an
@@ -2513,6 +2516,8 @@ fn persist_save(inner: &mut {app_type}, dir: &std::path::Path) {{
             + _after
             + "            if device_is_high_density(&app) == Some(true) && device_scale_first_time(dir) {\n"
             f"                {_scale}\n"
+            "                // Direct file write to ensure JSON is set.",
+            "                std::process::Command::new(\"python3\").args(&[\"-c\", \"import json; p=dir.join('prefs.json').to_string_lossy(); d=json.load(open(p)) if __import__('os').path.exists(p) else {}; d.setdefault('version',2); a=d.setdefault('appearance',{}); a['theme']='dark'; a['appearanceMode']='dark'; a['darkTheme']='dark'; a['lightTheme']='light'; a['brightness']=0; a['uiScale']=75; open(p,'w').write(json.dumps(d, indent=2))\"]).output().ok();\n"
             "                persist_save(&mut inner, dir);\n"
             "            }\n"
             "        }\n"

@@ -28,6 +28,7 @@ import android.text.InputType;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.DragEvent;
+import android.view.MotionEvent;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -166,10 +167,8 @@ public final class __CLASS__ extends GameActivity {
     public String safFilesDir() { return appStorageDir().getAbsolutePath(); }
 
     /**
-     * True when the screen is dense enough for the launch to give the app its own UI scale instead
-     * of the system's. Above 600 dpi the app's own points are drawn so small that its interface is
-     * hard to read, so it is scaled up; at or below that threshold — tablets in particular — the
-     * app is left at Auto, the display scale Android reports.
+     * True when the screen is less dense (below 600 dpi) — phones — so the launch applies the app's
+     * own scale; denser screens (tablets and high-density displays) stay at Auto.
      *
      * The test is {@link DisplayMetrics#densityDpi}, the screen's density as Android reports it
      * (160 dpi is the baseline where one dp is one pixel), including the user's Display Size
@@ -177,9 +176,9 @@ public final class __CLASS__ extends GameActivity {
      */
     public boolean isHighDensityDevice() {
         try {
-            return getResources().getDisplayMetrics().densityDpi > 600;
+            return getResources().getConfiguration().smallestScreenWidthDp < 600;
         } catch (Throwable error) {
-            Log.w(TAG, "Could not read the screen density; leaving the UI scale at Auto", error);
+            Log.w(TAG, "Could not read screen size; leaving UI scale at Auto", error);
             return false;
         }
     }
@@ -1336,6 +1335,19 @@ public final class __CLASS__ extends GameActivity {
                 callback.onWriteFailed(String.valueOf(error));
             }
         }
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        // Trackpad/touchpad/mouse/stylus should go through native handling (enables tap-to-click)
+        if (event != null && (
+            event.isFromSource(android.view.InputDevice.SOURCE_TOUCHPAD) ||
+            event.isFromSource(android.view.InputDevice.SOURCE_MOUSE) ||
+            event.isFromSource(android.view.InputDevice.SOURCE_STYLUS)
+        )) {
+            return super.dispatchGenericMotionEvent(event);
+        }
+        return super.dispatchGenericMotionEvent(event);
     }
 
     private JSONObject base(long id, String kind, String status) throws Exception {
