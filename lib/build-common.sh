@@ -626,7 +626,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "54"
+GENERATOR_VERSION = "55"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -2268,7 +2268,6 @@ UI_SCALE_BOOTSTRAP = {
     "figcraft": '''inner.session.prefs.ui_scale = 0.75;''',
     "cadcraft": '''inner.options.interface_scale = 0.75;''',
     # Mobile apps scaled to 75%.
-    "lightcraft": '''inner.ui.ui_scale = 0.75;''',
     "subcraft": '''inner.ui.ui_scale = 0.75;''',
 }
 
