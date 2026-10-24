@@ -23,6 +23,7 @@ Replace `-pdfcraft` with any supported app name.
 ```text
 photocraft vectorcraft filmcraft lightcraft pdfcraft effectcraft
 designcraft figcraft wordcraft soundcraft deckcraft cadcraft gridcraft
+subcraft
 ```
 
 App names are passed as command-line flags, such as `-photocraft` or `-vectorcraft`.
@@ -31,6 +32,10 @@ App names are passed as command-line flags, such as `-photocraft` or `-vectorcra
 
 | Option | Description |
 | --- | --- |
+| `-stable` | Build against latest stable release tag of the upstream app (default). |
+| `-main`, `-latest` | Build against the rolling upstream `main` branch. |
+| `-tag=<tag>` | Build against a specific git tag (e.g. `-tag=v0.12.1`). |
+| `-branch=<branch>` | Build against a specific git branch. |
 | `-appname=<name>` | Override the Android display name. By default, the app's built-in title is used. |
 | `-packagename=<pkg>` | Override the Android package name. By default, the package is `com.artcraft.<app>`. |
 | `-appicon=<path>` | Use a custom launcher icon PNG. By default, the app's own icon is used. |
@@ -210,6 +215,12 @@ Every app is registered with Android's **Open with** and share sheets for the fi
 File associations are centralized in [`lib/file_associations.py`](lib/file_associations.py) and applied to launcher and adapter manifests to keep them consistent. Extensions Android's MIME database knows are matched by the type it actually reports (for example `.psd` is `image/x-photoshop`, not `image/vnd.adobe.photoshop`), and every extension is also matched by file name so that a provider which stamps a generic `application/octet-stream` still offers the app. Those by-name elements pair the escaped-dot pattern with `android:host="*"` — Android only evaluates a `pathPattern` when the element also declares an authority, and without one a scheme-plus-path element matches every `file://`/`content://` URI — and the same pattern is repeated in a second, VIEW-only element declaring `mimeType="*/*"`, because a filter that declares a MIME type only matches intents that carry one. An app is therefore offered for its own extensions and types and for nothing else.
 
 When a file is opened, shared, or passed through a link, the launcher copies it into app-private storage off the UI thread and opens it through the same path used by the app's own file picker. This is supported while the app is already running as well as on initial launch, and the file opens straight away: egui only draws a frame when something asks it to, so a background watcher asks the app for a repaint as soon as a file is waiting, instead of leaving it in the queue until the user happens to touch the screen.
+
+## Automated builds & CI
+
+A complete GitHub Actions CI/CD pipeline is provided in [`.github/workflows/build.yml`](.github/workflows/build.yml). It builds all 13 apps in parallel across an isolated matrix, compiles against stable releases, caches dependencies via sccache and Gradle, tests APK integrity, and automatically publishes GitHub releases when tags are pushed.
+
+For detailed architecture, caching strategy, and workflow execution details, see [`docs/ci-workflow.md`](docs/ci-workflow.md).
 
 ## Signing and distribution
 

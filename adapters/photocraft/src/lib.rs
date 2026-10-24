@@ -398,8 +398,8 @@ fn services(bridge: AndroidFileBridge, picker: Arc<PickerState>, prefs_path: Pat
         // by the app's own per-frame inbox, exactly like a document chosen in the picker.
         inbox: Some(inbox),
         import: Some(Box::new(
-            |name: &str, bytes: &[u8], max_svg_group_depth: usize| {
-                photocraft_io::import_with_svg_group_depth(name, bytes, max_svg_group_depth)
+            |name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
+                photocraft_io::import_with_options(name, bytes, opts)
                     .map(|r| (r.document, r.warnings))
                     .map_err(|e| e.to_string())
             },

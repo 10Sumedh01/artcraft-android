@@ -16,6 +16,10 @@ Required:
   -<app>              App to build (leading hyphen)
 
 Options:
+  -stable             Build against latest stable release tag (default)
+  -main, -latest      Build against upstream main branch
+  -tag=<tag>          Build against a specific git tag
+  -branch=<branch>    Build against a specific git branch
   -appname=<name>     Override the display name (default: app's built-in title)
   -packagename=<pkg>  Override the Android package (default: com.artcraft.<app>)
   -appicon=<path>     Use a custom launcher icon PNG (default: app's own icon)
@@ -51,11 +55,33 @@ fi
 APPNAME=""
 PACKAGENAME=""
 APPICON=""
+BUILD_SOURCE="${BUILD_SOURCE:-stable}"
+RAW_APP=""
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         -h|--help)
             usage
             exit 0
+            ;;
+        -stable)
+            BUILD_SOURCE="stable"
+            shift
+            ;;
+        -main|-latest)
+            BUILD_SOURCE="main"
+            shift
+            ;;
+        -tag=*)
+            BUILD_SOURCE="${1#-tag=}"
+            shift
+            ;;
+        -branch=*)
+            BUILD_SOURCE="${1#-branch=}"
+            shift
+            ;;
+        -source=*)
+            BUILD_SOURCE="${1#-source=}"
+            shift
             ;;
         -appname=*)
             APPNAME="${1#-appname=}"
@@ -70,6 +96,11 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
         -*)
+            if [[ -n "$RAW_APP" ]]; then
+                echo "Multiple app targets specified: $RAW_APP and $1" >&2
+                usage
+                exit 2
+            fi
             RAW_APP="$1"
             shift
             ;;
@@ -458,7 +489,7 @@ if [[ -e "$SRC" ]]; then
         fail "$SRC is an incomplete checkout: some files of the workspace are missing on disk. That happens when a clone is interrupted (a killed build, or a full disk). Move $SRC aside and run the build again to re-clone it."
     fi
     echo "Reusing existing source checkout (including your Android port changes)."
-    echo "Commit: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "Ref/Commit: $(git -C "$SRC" describe --tags --always 2>/dev/null || git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "Source is not automatically reset or updated."
 else
     # The clone goes into a scratch directory first and is only moved into place once the tree
@@ -472,9 +503,32 @@ else
         rm -rf "$SRC_TMP"
         fail "Only $((FREE_BYTES / 1048576)) MiB are free on the disk holding $ROOT/source, but cloning $TITLE needs about 1 GiB. Free some space (build/ holds the Cargo output of every app) and run the build again."
     fi
-    if ! git clone --depth 1 "$REPO" "$SRC_TMP"; then
+
+    TARGET_REF=""
+    if [[ "$BUILD_SOURCE" == "stable" ]]; then
+        echo "Looking up latest stable release tag for $TITLE ($REPO)..."
+        LATEST_TAG="$(git ls-remote --tags --sort=-v:refname "$REPO" 'v*' 2>/dev/null | grep -v '\^{}' | head -n 1 | awk '{print $2}' | sed 's|refs/tags/||' || true)"
+        if [[ -n "$LATEST_TAG" ]]; then
+            TARGET_REF="$LATEST_TAG"
+            echo "  -> Found latest stable release tag: $TARGET_REF"
+        else
+            echo "  -> No 'v*' release tag found; falling back to default branch."
+        fi
+    elif [[ "$BUILD_SOURCE" != "main" && "$BUILD_SOURCE" != "master" && "$BUILD_SOURCE" != "latest" && -n "$BUILD_SOURCE" ]]; then
+        TARGET_REF="$BUILD_SOURCE"
+        echo "Using target ref: $TARGET_REF"
+    else
+        echo "Building against upstream main branch."
+    fi
+
+    CLONE_ARGS=(--depth 1)
+    if [[ -n "$TARGET_REF" ]]; then
+        CLONE_ARGS+=(--branch "$TARGET_REF")
+    fi
+
+    if ! git clone "${CLONE_ARGS[@]}" "$REPO" "$SRC_TMP"; then
         rm -rf "$SRC_TMP"
-        fail "Cloning $REPO failed. Check the network connection and the free disk space, then run the build again."
+        fail "Cloning $REPO (ref: ${TARGET_REF:-default}) failed. Check the network connection and the free disk space, then run the build again."
     fi
     if ! source_tree_is_complete "$SRC_TMP"; then
         rm -rf "$SRC_TMP"
@@ -520,6 +574,21 @@ if app == "photocraft":
         '            export_presets: take(&mut m, "export_presets"),\n',
     ):
         fixed.append("crates/engine/src/presets/mod.rs")
+elif app == "cadcraft":
+    # Upstream Dependabot merged PR #1957 which bumped egui to 0.37, harfrust to 0.14,
+    # quick-xml to 0.42, and rstar to 0.13, breaking the codebase against those new APIs.
+    # Revert them to the 0.36 ecosystem until cadcraft repairs them upstream.
+    for rel, old, new in [
+        ("Cargo.toml", 'egui = "0.37"', 'egui = "0.36"'),
+        ("Cargo.toml", 'egui_kittest = "0.37"', 'egui_kittest = "0.36"'),
+        ("Cargo.toml", 'eframe = { version = "0.37", default-features = false }', 'eframe = { version = "0.36", default-features = false }'),
+        ("Cargo.toml", 'egui-wgpu = "0.37"', 'egui-wgpu = "0.36"'),
+        ("Cargo.toml", 'harfrust = "0.14"', 'harfrust = "0.13.3"'),
+        ("Cargo.toml", 'quick-xml = "0.42"', 'quick-xml = "0.41"'),
+        ("crates/engine/Cargo.toml", 'rstar = { version = "0.13", default-features = false }', 'rstar = { version = "0.12", default-features = false }'),
+    ]:
+        if fix(rel, old, new):
+            fixed.append(f"{rel} ({old} -> {new})")
 
 if fixed:
     print(f"  Repaired upstream compile errors still present in {title}: {', '.join(fixed)}")
@@ -4022,7 +4091,7 @@ BUILT_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*-unsign
     find "$ANDROID_DIR/android/build/outputs" -type f -name '*.apk' -print >&2 || true
     fail "Gradle reported success but the APK artifact was not found. Log: $ROOT/$LOG"
 }
-cp -f "$BUILT_APK" "$FINAL_APK"
+cp -f "$BUILT_APK" "${FINAL_APK}.tmp" && mv -f "${FINAL_APK}.tmp" "$FINAL_APK"
 
 say 7 "Verifying the Android file bridge in the built APK..."
 verify_android_bridge "$APP" "$BUILT_APK"
