@@ -626,7 +626,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "53"
+GENERATOR_VERSION = "54"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -2516,8 +2516,6 @@ fn persist_save(inner: &mut {app_type}, dir: &std::path::Path) {{
             + _after
             + "            if device_is_high_density(&app) == Some(true) && device_scale_first_time(dir) {\n"
             f"                {_scale}\n"
-            "                // Direct file write to ensure JSON is set.",
-            "                std::process::Command::new(\"python3\").args(&[\"-c\", \"import json; p=dir.join('prefs.json').to_string_lossy(); d=json.load(open(p)) if __import__('os').path.exists(p) else {}; d.setdefault('version',2); a=d.setdefault('appearance',{}); a['theme']='dark'; a['appearanceMode']='dark'; a['darkTheme']='dark'; a['lightTheme']='light'; a['brightness']=0; a['uiScale']=75; open(p,'w').write(json.dumps(d, indent=2))\"]).output().ok();\n"
             "                persist_save(&mut inner, dir);\n"
             "            }\n"
             "        }\n"
