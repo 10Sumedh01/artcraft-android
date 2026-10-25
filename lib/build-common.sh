@@ -3865,28 +3865,14 @@ fi
 # Some apps also use arboard (the clipboard) from a crate in the launcher's dependency graph
 # (PDFCraft does). arboard ships no Android backend and its Unix backend needs X11/Wayland, so it
 # cannot compile for `aarch64-linux-android`. Vendor the builder's Android-compatible stub (a
-# no-op clipboard) and patch it in, exactly like rfd above. Clipboard access degrades gracefully;
-# real Android clipboard support needs a platform adapter (see adapters/README.md).
-if grep -rqE '\barboard\b' "$SRC"/crates/*/src 2>/dev/null; then
+# no-op clipboard) and patch it in. If crates use `arboard = { workspace = true }`, we must
+# replace the workspace dependency; otherwise we add it via `[patch.crates-io]`.
+if grep -rqE '\barboard\b' "$SRC"/crates/*/src "$SRC"/apps/*/src 2>/dev/null; then
     echo "Vendoring an Android-compatible arboard for $TITLE (clipboard access becomes a no-op)..."
     mkdir -p "$SRC/vendor"
     rm -rf "$SRC/vendor/arboard"
     cp -a "$ROOT/vendor/arboard" "$SRC/vendor/arboard"
-    python3 - "$SRC/Cargo.toml" <<'PY'
-from pathlib import Path
-import sys, tomllib
-p = Path(sys.argv[1])
-s = p.read_text()
-entry = 'arboard = { path = "vendor/arboard" }'
-import re
-s = re.sub(r'^\s*arboard\s*=\s*\{.*?\}\s*(?:#.*)?\n?', '', s, flags=re.M)
-if entry not in s:
-    header = "[patch.crates-io]"
-    s = (s.replace(header, header + "\n" + entry, 1) if header in s
-         else s.rstrip() + "\n\n" + header + "\n" + entry + "\n")
-    tomllib.loads(s)
-    p.write_text(s)
-PY
+    python3 /tmp/fix_arboard.py "$SRC/Cargo.toml" "$SRC"
 fi
 
 # winit's stock Android backend only translates touch actions: `handle_input_event` maps
