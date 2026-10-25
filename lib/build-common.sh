@@ -2778,14 +2778,9 @@ name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
 
-# Audio input for recording (SoundCraft, FilmCraft voice-over, etc.). Required at runtime;
+# Audio input for recording (SoundCraft only). Required at runtime;
 # cpal's AAudio backend requests the input stream only if the app opens it, but Android rejects
 # the stream without the manifest permission.
-[[package.metadata.android.uses_permission]]
-name = "android.permission.RECORD_AUDIO"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.MODIFY_AUDIO_SETTINGS"
 
 [package.metadata.android.application]
 label = "{title}"

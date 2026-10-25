@@ -236,12 +236,7 @@ public final class __CLASS__ extends GameActivity {
             } catch (Exception e) {
                 Log.e(TAG, "Could not request file access", e);
             }
-            // Request microphone permission for apps that open audio input (SoundCraft)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                    requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_PERMISSIONS);
-                }
-            }
+            // Microphone permission is only requested by apps that need it via safRequestMicrophonePermission()
         });
     }
 
