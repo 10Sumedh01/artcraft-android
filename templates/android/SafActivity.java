@@ -703,6 +703,9 @@ public final class __CLASS__ extends GameActivity {
             imeView.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
             imeView.setImeOptions(EditorInfo.IME_FLAG_NO_FULLSCREEN);
             imeView.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                imeView.setDefaultFocusHighlightEnabled(false);
+            }
             // Long-pressing this host would open the system text-selection handles and action
             // mode over the canvas (the host is invisible, so they would float detached over the
             // app's own menus). Block them the same way the content views are blocked in

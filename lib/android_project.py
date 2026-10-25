@@ -64,6 +64,7 @@ THEMES_XML = """<?xml version="1.0" encoding="utf-8"?>
     <style name="Theme.Artcraft" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:defaultFocusHighlightEnabled">false</item>
     </style>
 </resources>
 """
