@@ -1862,7 +1862,7 @@ bash build.sh -app
 Bump when launcher template changes significantly.
 
 ### 51.2 Builder Version
-`BUILDER_VERSION = "0.4.0"` (current)
+`BUILDER_VERSION = "0.4.1"` (current)
 Shown in UpdateCheck, included in APK metadata.
 
 ### 51.3 Key Milestones

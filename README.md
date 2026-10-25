@@ -105,11 +105,11 @@ Replace `-pdfcraft` with any supported application name.
 
 ### Supported Build Targets
 
-```text
-photocraft vectorcraft filmcraft lightcraft pdfcraft effectcraft
-designcraft figcraft wordcraft soundcraft deckcraft cadcraft gridcraft
-subcraft
-```
+| App | Repo |
+| --- | --- |
+| photocraft, vectorcraft, filmcraft, lightcraft, pdfcraft, effectcraft | Storytold (official) |
+| designcraft, figcraft, wordcraft, soundcraft, deckcraft, cadcraft, gridcraft | Storytold (official) |
+| subcraft | [Aalzard/subcraft](https://github.com/Aalzard/subcraft) *(Unofficial)* |
 
 App names are passed as command-line flags, such as `-photocraft` or `-vectorcraft`.
 
