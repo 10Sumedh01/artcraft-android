@@ -3872,7 +3872,7 @@ if grep -rqE '\barboard\b' "$SRC"/crates/*/src "$SRC"/apps/*/src 2>/dev/null; th
     mkdir -p "$SRC/vendor"
     rm -rf "$SRC/vendor/arboard"
     cp -a "$ROOT/vendor/arboard" "$SRC/vendor/arboard"
-    python3 /tmp/fix_arboard.py "$SRC/Cargo.toml" "$SRC"
+    python3 "$ROOT/fix_arboard.py" "$SRC/Cargo.toml" "$SRC"
 fi
 
 # winit's stock Android backend only translates touch actions: `handle_input_event` maps
