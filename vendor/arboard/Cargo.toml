@@ -179,4 +179,3 @@ features = [
     "Win32_UI_Shell",
 ]
 
-[workspace]
