@@ -7,9 +7,12 @@ src_root = Path(sys.argv[2])  # $SRC
 
 s = root_toml.read_text()
 
-# Check if any crate uses arboard with workspace = true
+# Check if any crate uses arboard with workspace = true (excluding vendor)
 uses_workspace = False
 for cargo in src_root.rglob('Cargo.toml'):
+    # Skip vendored copies
+    if 'vendor/' in str(cargo):
+        continue
     try:
         txt = cargo.read_text()
         if re.search(r'arboard\s*=\s*\{[^}]*workspace\s*=\s*true', txt):
@@ -22,23 +25,17 @@ entry_path = 'arboard = { path = "vendor/arboard" }'
 
 if uses_workspace:
     # Replace arboard in [workspace.dependencies] to point to vendored path
-    # Try to preserve features if they exist
     def repl_ws(m):
-        # Extract features if present
         inner = m.group(0)
         features = re.search(r'features\s*=\s*\[([^\]]+)\]', inner)
         if features:
             return f'arboard = {{ path = "vendor/arboard", features = [{features.group(1)}] }}'
         return 'arboard = { path = "vendor/arboard" }'
-    # Match arboard in workspace.dependencies section
-    # This is a simple approach - replace any arboard = { ... } line
     s2 = re.sub(r'^\s*arboard\s*=\s*\{[^}]*\}\s*(?:#.*)?$', repl_ws, s, flags=re.M)
     if s2 == s:
-        # Maybe it's just arboard = "version" style
         s2 = re.sub(r'^\s*arboard\s*=.*$', 'arboard = { path = "vendor/arboard" }', s, flags=re.M)
     s = s2
 else:
-    # Remove from deps and add to patch.crates-io
     s = re.sub(r'^\s*arboard\s*=\s*\{.*?\}\s*(?:#.*)?\n?', '', s, flags=re.M)
     s = re.sub(r'^\s*arboard\s*=.*\n?', '', s, flags=re.M)
     header = "[patch.crates-io]"
@@ -46,7 +43,6 @@ else:
         s = (s.replace(header, header + "\n" + entry_path, 1) if header in s
              else s.rstrip() + "\n\n" + header + "\n" + entry_path + "\n")
 
-# Validate
 try:
     tomllib.loads(s)
 except Exception as e:
