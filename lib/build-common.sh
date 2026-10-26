@@ -611,7 +611,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "60"
+GENERATOR_VERSION = "61"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -1857,6 +1857,8 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, _inbox: SafInbox) -> 
     Services {
         pick_open: Some(Box::new(move || saf_open_paths(&open_bridge, &open_state).into_iter().next())),
         pick_save: Some(Box::new(move |name: &str| saf_save_path(&save_bridge, &save_state, name))),
+        pick_lisp: None,
+        no_file_system: false,
     }
 }
 ''',
