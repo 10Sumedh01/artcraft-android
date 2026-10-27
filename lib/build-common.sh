@@ -611,7 +611,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "61"
+GENERATOR_VERSION = "62"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -628,6 +628,8 @@ if (custom / "Cargo.toml").is_file() and (custom / "src" / "lib.rs").is_file():
     shutil.copy2(root / "templates" / "android" / "system_fonts.rs", android_dir / "src" / "system_fonts.rs")
     # The shared Android soft-keyboard bridge, referenced by `mod ime_bridge;` in the adapter.
     shutil.copy2(root / "templates" / "android" / "ime_bridge.rs", android_dir / "src" / "ime_bridge.rs")
+    # The shared Android mobile touch overlay and virtual toolbar.
+    shutil.copy2(root / "templates" / "android" / "mobile_overlay.rs", android_dir / "src" / "mobile_overlay.rs")
     # The adapter's launcher gets the same icons as the generated ones: density mipmaps plus the
     # API 26+ adaptive layers (see lib/app_icons.py). An adapter that ships its own `assets/app-icon`
     # seeds the app tree with it when the app has no icon of its own (SubCraft ships only a Windows
@@ -659,8 +661,8 @@ if android_dir.exists():
             print("Android launcher already generated; preserving it.")
             # The shared modules are refreshed even when the launcher itself is kept: they are
             # copied into it rather than generated, so a change to one of them (the system-font
-            # bridge, the soft-keyboard bridge) has to reach the launcher that is already there.
-            for shared in ("system_fonts.rs", "ime_bridge.rs"):
+            # bridge, the soft-keyboard bridge, the mobile touch overlay) has to reach the launcher that is already there.
+            for shared in ("system_fonts.rs", "ime_bridge.rs", "mobile_overlay.rs"):
                 src_shared = root / "templates" / "android" / shared
                 dst_shared = android_dir / "src" / shared
                 if src_shared.is_file() and dst_shared.parent.is_dir():
@@ -2807,6 +2809,7 @@ icon = "@mipmap/ic_launcher"
     # the Activity's IME events into egui. Its presence is also what keeps the vendored
     # android-activity (which forwards show/hide to the Activity's imeShow/imeHide) in step.
     imports.append("mod ime_bridge;")
+    imports.append("mod mobile_overlay;")
     if re.search(r"\bSession\b", construct):
         imports.append(f"use {engine_ident}::Session;")
     services_syms = [s for s in ("NoServices", "Services") if re.search(r"\b" + s + r"\b", (SAF_RECIPES.get(app) or {}).get("construct_expr") or construct)]
@@ -3417,6 +3420,7 @@ struct AndroidShell {{
     inner: {app_type},
     app: AndroidApp,
     ime: ime_bridge::ime::ImeBridge,
+    mobile_overlay: mobile_overlay::MobileOverlay,
     modifiers: egui::Modifiers,
     fullscreen_applied: bool,
     probe: InputProbe,
@@ -3429,7 +3433,8 @@ struct AndroidShell {{
 impl AndroidShell {{
     fn new(mut inner: {app_type}, app: AndroidApp{saf_new_params}) -> Self {{
         {persist_new_body}let ime = ime_bridge::ime::ImeBridge::new(&app);
-        Self {{ inner, app, ime, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(), bars_theme: None, back_pending: false, closing: false, close_asked: false{saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
+        let mobile_overlay = mobile_overlay::MobileOverlay::new();
+        Self {{ inner, app, ime, mobile_overlay, modifiers: egui::Modifiers::default(), fullscreen_applied: false, probe: InputProbe::default(), bars_theme: None, back_pending: false, closing: false, close_asked: false{saf_new_init}{intent_init}{persist_new_init}{staged_new_init} }}
     }}
 {saf_poll_method}{intent_method}{persist_methods}{staged_methods}
     /// Keep the system-bar icon contrast on the app's active theme: egui's light/dark choice is
@@ -3537,7 +3542,8 @@ impl Drop for AndroidShell {{
 impl eframe::App for AndroidShell {{
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {{
 {intent_logic}{saf_logic_poll}{persist_logic}{staged_logic}        {inner_logic}
-{ime_hide_logic}        self.sync_bar_appearance(ctx);
+{ime_hide_logic}        self.mobile_overlay.ui(ctx, &self.ime);
+        self.sync_bar_appearance(ctx);
 {quit_check}    }}
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {{
@@ -3563,6 +3569,7 @@ impl eframe::App for AndroidShell {{
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {{
         self.probe.observe(raw);
         self.ime.poll(raw);
+        self.mobile_overlay.event(raw);
         self.refresh_fullscreen(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         self.map_android_back(raw);
@@ -3741,6 +3748,8 @@ fn android_main(android_app: android_activity::AndroidApp) {{
     shutil.copy2(root / "templates" / "android" / "system_fonts.rs", staging_dir / "src" / "system_fonts.rs")
     # The shared Android soft-keyboard bridge, referenced by `mod ime_bridge;` in the entry above.
     shutil.copy2(root / "templates" / "android" / "ime_bridge.rs", staging_dir / "src" / "ime_bridge.rs")
+    # The shared Android mobile touch overlay and virtual toolbar.
+    shutil.copy2(root / "templates" / "android" / "mobile_overlay.rs", staging_dir / "src" / "mobile_overlay.rs")
 
     # Audio output on Android: the apps get their audio backend from the platform layer (cpal), and
     # their desktop modules are plain cpal code compiled straight from the app's own source into the

@@ -36,6 +36,7 @@ mod system_fonts;
 // templates/android/ime_bridge.rs). The `mod ime_bridge;` marker also keeps the vendored
 // android-activity, which forwards show/hide to this Activity's imeShow/imeHide, in step.
 mod ime_bridge;
+mod mobile_overlay;
 
 /// Emitted at startup so the builder can confirm the bridge is present in the packaged `.so`.
 const SAF_BRIDGE_MARKER: &str = "ARTCRAFT_VECTORCRAFT_SAF_BRIDGE_V1";
@@ -699,6 +700,7 @@ struct VectorCraftAndroidApp {
     bridge: AndroidFileBridge,
     picks: Arc<PickState>,
     ime: ime_bridge::ime::ImeBridge,
+    mobile_overlay: mobile_overlay::MobileOverlay,
     modifiers: egui::Modifiers,
     persist: Option<std::path::PathBuf>,
     persist_last: Option<std::time::Instant>,
@@ -895,12 +897,14 @@ impl eframe::App for VectorCraftAndroidApp {
         watch_incoming(&self.bridge, ctx);
         drain_incoming(&self.bridge, &self.intent_inbox, &mut self.intent_warmup);
         self.staged_prune_tick();
+        self.mobile_overlay.ui(ctx, &self.ime);
         self.inner.logic(ctx);
         self.persist_tick();
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.ime.poll(raw);
+        self.mobile_overlay.event(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         if raw.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false))) {
             self.persist_now();
@@ -981,6 +985,7 @@ fn android_main(android_app: AndroidApp) {
                 bridge: app_bridge.clone_for_services(),
                 picks: app_picks.clone(),
                 ime: ime_bridge::ime::ImeBridge::new(&app_bridge.app),
+                mobile_overlay: mobile_overlay::MobileOverlay::new(),
                 modifiers: egui::Modifiers::default(),
                 persist,
                 persist_last: None,

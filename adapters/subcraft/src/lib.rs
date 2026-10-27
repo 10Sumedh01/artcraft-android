@@ -32,6 +32,7 @@ mod system_fonts;
 // templates/android/ime_bridge.rs). The `mod ime_bridge;` marker also keeps the vendored
 // android-activity, which forwards show/hide to this Activity's imeShow/imeHide, in step.
 mod ime_bridge;
+mod mobile_overlay;
 
 // The SAF bridge, inlined so the adapter is self-contained (a custom adapter is copied verbatim and
 // does not receive templates/android/saf_bridge.rs).
@@ -261,6 +262,7 @@ struct SubCraftAndroidApp {
     bridge: saf::Bridge,
     state: Arc<SafState>,
     ime: ime_bridge::ime::ImeBridge,
+    mobile_overlay: mobile_overlay::MobileOverlay,
     modifiers: egui::Modifiers,
     // Files the system asked us to open are staged by the Activity; this is the shared queue the
     // app's own per-frame poll drains. `intent_warmup` skips the first couple of frames so the app
@@ -288,6 +290,7 @@ impl eframe::App for SubCraftAndroidApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         ensure_screen_rect(&self.app, ctx, raw);
         self.ime.poll(raw);
+        self.mobile_overlay.event(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         if raw.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false))) {
             self.state.mirror.sync(&self.bridge);
@@ -297,6 +300,7 @@ impl eframe::App for SubCraftAndroidApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         system_fonts::install_system_fonts(ui.ctx());
+        self.mobile_overlay.ui(ui.ctx(), &self.ime);
         // SubCraft does all of its per-frame work (input, picker delivery, autosave) in `ui`, so
         // there is nothing to forward to `logic` — calling it would run the frame twice.
         self.inner.ui(ui, frame);
@@ -434,6 +438,7 @@ fn android_main(android_app: AndroidApp) {
                 app: app_bridge.android_app().clone(),
                 state: Arc::clone(&state),
                 ime: ime_bridge::ime::ImeBridge::new(app_bridge.android_app()),
+                mobile_overlay: mobile_overlay::MobileOverlay::new(),
                 modifiers: egui::Modifiers::default(),
                 intent_warmup: 2,
                 bridge: app_bridge.clone_ref(),

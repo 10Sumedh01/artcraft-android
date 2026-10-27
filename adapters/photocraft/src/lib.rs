@@ -33,6 +33,7 @@ mod system_fonts;
 // templates/android/ime_bridge.rs). The `mod ime_bridge;` marker also keeps the vendored
 // android-activity, which forwards show/hide to this Activity's imeShow/imeHide, in step.
 mod ime_bridge;
+mod mobile_overlay;
 
 /// Emitted at startup so a device log (and the packaged `.so` strings) can confirm this shell —
 /// including the Android modifier-key fix and immersive fullscreen — is the one that is running.
@@ -606,6 +607,7 @@ struct PhotoCraftAndroidApp {
     bridge: AndroidFileBridge,
     picker: Arc<PickerState>,
     ime: ime_bridge::ime::ImeBridge,
+    mobile_overlay: mobile_overlay::MobileOverlay,
     modifiers: egui::Modifiers,
     // Files the system asked us to open are staged by the Activity; this is the shared queue the
     // app's own inbox drains. `intent_warmup` skips the first couple of frames so the app has
@@ -795,6 +797,7 @@ impl eframe::App for PhotoCraftAndroidApp {
         drain_incoming(&self.bridge, &self.intent_inbox, &mut self.intent_warmup);
         self.staged_prune_tick();
         self.persist_tick();
+        self.mobile_overlay.ui(ctx, &self.ime);
         self.inner.logic(ctx, frame);
         if self.inner.session.has_jobs() || !self.inner.jobs.opens.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -808,6 +811,7 @@ impl eframe::App for PhotoCraftAndroidApp {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.ime.poll(raw);
+        self.mobile_overlay.event(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         if raw.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false))) {
             self.persist_now();
@@ -956,6 +960,7 @@ fn android_main(android_app: AndroidApp) {
                 bridge: app_bridge.clone_for_services(),
                 picker: app_picker.clone(),
                 ime: ime_bridge::ime::ImeBridge::new(&app_bridge.app),
+                mobile_overlay: mobile_overlay::MobileOverlay::new(),
                 modifiers: egui::Modifiers::default(),
                 intent_inbox: app_intent_inbox.clone(),
                 intent_warmup: 2,
