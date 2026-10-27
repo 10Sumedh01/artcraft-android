@@ -153,9 +153,10 @@ fi
 # The builder's own version, baked into every APK. The app compares it with the latest GitHub
 # release of this repository on launch and offers the download when GitHub has a newer one
 # (see templates/android/UpdateCheck.java). Bump it when a release is published.
-BUILDER_VERSION="0.4.1"
-UPDATE_API_URL="https://api.github.com/repos/MostafaXS1/artcraft-android/releases/latest"
-UPDATE_PAGE_URL="https://github.com/MostafaXS1/artcraft-android/releases/latest"
+BUILDER_VERSION="0.5.0"
+UPDATE_REPO="${ARTCRAFT_UPDATE_REPO:-${GITHUB_REPOSITORY:-MostafaXS1/artcraft-android}}"
+UPDATE_API_URL="https://api.github.com/repos/${UPDATE_REPO}/releases/latest"
+UPDATE_PAGE_URL="https://github.com/${UPDATE_REPO}/releases/latest"
 
 # Absolute: the build later `cd`s into the launcher directory, and cargo-ndk/Gradle paths
 # derived from $ANDROID_DIR must keep resolving from there.
