@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.0 — 2026-10-27 (Mobile Enhancements Release)
+
+### Added
+- **Mobile Touch Accessory Overlay Dock**:
+  - Floating, draggable on-screen accessory toolbar (`MobileOverlay`) in `egui::Order::Foreground`.
+  - Sticky virtual modifier keys (`Ctrl`, `Alt`, `Shift`, `Space` pan) allowing multi-selection, constrained aspect ratio drags, and canvas navigation without physical keyboards.
+  - Touch long-press right-click: holding a single touch stationary for ~450ms synthesizes a secondary mouse click for native context menus.
+  - Quick zoom buttons (`🔍+` / `🔍-`) for one-tap canvas zooming.
+  - Collapsible into a minimal floating bubble (`📱 Touch` / `📱 Touch 🔒`) with real-time lock status feedback.
+- **Soft Keyboard Lock (`🔒 Lock: ON/OFF`)**:
+  - Dedicated lock toggle prevents accidental touches or clicks on the document/canvas from summoning the Android virtual keyboard.
+  - Direct explicit summon button (`[⌨ Keyboard]`) to force-show the soft input method whenever needed.
+- **Dynamic Fork & Release Automation**:
+  - Enhanced GitHub Actions workflow (`.github/workflows/build.yml`) supporting one-click release publishing via `workflow_dispatch` and automatic release generation on `v*` tag pushes.
+  - Dynamic repository detection via `ARTCRAFT_UPDATE_REPO` and `GITHUB_REPOSITORY` so forked repositories automatically check for updates against the fork's own releases.
+- **Comprehensive Technical Documentation**:
+  - Added [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) detailing the Android Java host, native NDK glue, JNI bridges, SAF file staging, gesture state machines, and graphics lifecycles.
+  - Added [`docs/LEARNING_GUIDE.md`](docs/LEARNING_GUIDE.md) providing a systems programming tutorial on safe JNI interop, multi-touch signal processing, and mobile porting patterns.
+  - Added [`docs/README.md`](docs/README.md) documentation index.
+
+### Changed & Fixed
+- **Responsive Pinch-to-Zoom (Zoom In & Zoom Out)**:
+  - Balanced `winit` gesture deadzones (`PAN_DEADZONE_PX = 14.0`, `PINCH_DEADZONE_PX = 14.0`) and reduced `PINCH_SPREAD_RATIO = 0.75` in `vendor/winit/src/platform_impl/android/mod.rs` so single-finger anchored and two-finger pinches are promptly classified as zoom instead of scroll.
+  - Implemented dynamic bidirectional handovers between Pan and Pinch gestures without requiring users to lift their fingers.
+  - Emitted synthetic `WindowEvent::CursorMoved` with the fingers' midpoint during pinch gestures so egui anchors zoom smoothly around the gesture centroid.
+  - Lowered minimum zoom threshold sensitivity to `1e-4` in `crates/ui-egui/src/canvas.rs` and `lib/scrolling.sh`.
+- **Generator Version Bumped to 62**: Automatically refreshes generated launchers in `source/<app>` with the new `mobile_overlay` module.
+
 ## v37 — 2026-10-20
 
 ### Fixed
