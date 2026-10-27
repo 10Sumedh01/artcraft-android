@@ -612,7 +612,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "63"
+GENERATOR_VERSION = "64"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -1325,6 +1325,7 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(vec![gridcraft_ui_egui::printing::Printer {
                 name: "Android print system".to_owned(),
+                PRINTER_LABEL_FIELD
                 default: true,
             }]);
             rx
@@ -1562,7 +1563,7 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(vec![wordcraft_ui_egui::printing::Printer {
                 name: "Android print system".to_owned(),
-                label: String::new(),
+                PRINTER_LABEL_FIELD
                 default: true,
             }]);
             rx
@@ -2004,6 +2005,27 @@ else:
         .replace("PICKED_PATHS", "Ok(paths)")
         .replace("PICK_CANCELLED", "Ok(Vec::new())")
     )
+
+# WordCraft and GridCraft printer struct changed upstream: craft-ui added a `label` field
+# after v0.11.0 / in newer craft-libs revisions. Check whether Printer struct in the checked-out
+# source contains the `label` field so the launcher compiles against both release tags and main.
+_has_printer_label = any(
+    re.search(r"(?:struct\s+)?Printer\s*\{[^}]*\blabel\s*:", p.read_text(errors="replace"))
+    for p in (src / "crates").rglob("*.rs")
+) if (src / "crates").exists() else False
+
+for _recipe_app in ("wordcraft", "gridcraft"):
+    if _recipe_app in SAF_RECIPES and "services" in SAF_RECIPES[_recipe_app]:
+        if _has_printer_label:
+            SAF_RECIPES[_recipe_app]["services"] = SAF_RECIPES[_recipe_app]["services"].replace(
+                "PRINTER_LABEL_FIELD", "label: String::new(),"
+            )
+        else:
+            SAF_RECIPES[_recipe_app]["services"] = (
+                SAF_RECIPES[_recipe_app]["services"]
+                .replace("                PRINTER_LABEL_FIELD\n", "")
+                .replace("PRINTER_LABEL_FIELD", "")
+            )
 
 # How the launcher opens a document the system handed it (an ACTION_VIEW/ACTION_SEND intent it is
 # registered for), once per staged file. Each entry is the body of the shell's `open_incoming`, so it
