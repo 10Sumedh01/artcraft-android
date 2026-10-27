@@ -76,6 +76,19 @@ public final class PhotoCraftActivity extends GameActivity {
     private EditText imeView;
     // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
     private volatile boolean imeWanted = false;
+    // True when keyboard is locked: auto-showing on screen touch/focus is suppressed.
+    private volatile boolean imeLocked = false;
+
+    public void imeSetLocked(boolean locked) {
+        this.imeLocked = locked;
+        if (locked) {
+            imeHide();
+        }
+    }
+
+    public boolean imeIsLocked() {
+        return this.imeLocked;
+    }
     // Some IMEs report one backspace press twice, through two different calls:
     // `deleteSurroundingText(1,0)` and `sendKeyEvent(KEYCODE_DEL)`. Both arrive back to back, in
     // the same IME dispatch — microseconds apart — while two deliberate taps are always further
@@ -429,6 +442,9 @@ public final class PhotoCraftActivity extends GameActivity {
 
     /** Show the soft keyboard by focusing the IME host view. Called by the Rust shell via JNI. */
     public void imeShow() {
+        if (imeLocked) {
+            return;
+        }
         final EditText view = imeView;
         if (view == null) {
             return;
@@ -465,6 +481,29 @@ public final class PhotoCraftActivity extends GameActivity {
                 });
             } catch (Throwable error) {
                 Log.w(TAG, "Could not show the soft keyboard", error);
+            }
+        });
+    }
+
+    /** Force-show the soft keyboard regardless of lock state. Called by the mobile accessory bar. */
+    public void imeShowForced() {
+        imeWanted = true;
+        final EditText view = imeView;
+        if (view == null) {
+            return;
+        }
+        runOnUiThread(() -> {
+            try {
+                view.setFocusable(true);
+                view.setFocusableInTouchMode(true);
+                view.requestFocus();
+                InputMethodManager imm =
+                        (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.showSoftInput(view, InputMethodManager.SHOW_FORCED);
+                }
+            } catch (Throwable error) {
+                Log.w(TAG, "Could not force show the soft keyboard", error);
             }
         });
     }

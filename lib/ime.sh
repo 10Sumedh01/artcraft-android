@@ -181,7 +181,7 @@ fix(
      * Called by the Rust shell over JNI, only when something happened.
      */
     public void imeInteraction() {
-        if (!imeWanted || !imeDismissed) {
+        if (imeLocked || !imeWanted || !imeDismissed) {
             return;
         }
         imeDismissed = false;

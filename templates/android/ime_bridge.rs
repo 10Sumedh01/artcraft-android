@@ -63,6 +63,79 @@ pub mod ime {
             }
         }
 
+        /// Show the soft keyboard by calling the Activity's `imeShow`.
+        pub fn show_ime(&self) -> Result<(), String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<()> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    match env.call_method(
+                        &*activity,
+                        jni_str!("imeShow"),
+                        jni_sig!("()V"),
+                        &[],
+                    ) {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            env.exception_clear();
+                            Err(error)
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }
+
+        /// Force show the soft keyboard even if locked (user explicitly tapped the button).
+        pub fn show_ime_forced(&self) -> Result<(), String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<()> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    match env.call_method(
+                        &*activity,
+                        jni_str!("imeShowForced"),
+                        jni_sig!("()V"),
+                        &[],
+                    ) {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            env.exception_clear();
+                            // Fallback to imeShow if imeShowForced is not present
+                            let _ = env.call_method(
+                                &*activity,
+                                jni_str!("imeShow"),
+                                jni_sig!("()V"),
+                                &[],
+                            );
+                            Err(error)
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }
+
+        /// Set whether the soft keyboard is locked (auto-popup on touch is suppressed).
+        pub fn set_locked(&self, locked: bool) -> Result<(), String> {
+            self.vm
+                .attach_current_thread(|env| -> jni::errors::Result<()> {
+                    let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                    let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                    match env.call_method(
+                        &*activity,
+                        jni_str!("imeSetLocked"),
+                        jni_sig!("(Z)V"),
+                        &[jni::objects::JValue::Bool(locked)],
+                    ) {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            env.exception_clear();
+                            Err(error)
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())
+        }
+
         /// Hide the soft keyboard by calling the Activity's `imeHide`. Used when focus is
         /// surrendered during scroll/draw so the keyboard doesn't persist.
         pub fn hide_ime(&self) -> Result<(), String> {
