@@ -113,8 +113,8 @@ The system uses a hybrid approach:
 **Constants in `lib/build-common.sh`:**
 ```bash
 BUILDER_VERSION="0.2.0"
-UPDATE_API_URL="https://api.github.com/repos/MostafaXS1/artcraft-android/releases/latest"
-UPDATE_PAGE_URL="https://github.com/MostafaXS1/artcraft-android/releases/latest"
+UPDATE_API_URL="https://api.github.com/repos/10Sumedh01/artcraft-android/releases/latest"
+UPDATE_PAGE_URL="https://github.com/10Sumedh01/artcraft-android/releases/latest"
 GENERATOR_VERSION="55"  # Bumped when generated launcher template changes
 ```
 
@@ -600,7 +600,7 @@ public class UpdateCheck {
     }
 }
 ```
-Needs `INTERNET` permission. Compares against `https://api.github.com/repos/MostafaXS1/artcraft-android/releases/latest`
+Needs `INTERNET` permission. Compares against `https://api.github.com/repos/10Sumedh01/artcraft-android/releases/latest`
 
 ## 14. Storage Access Framework (SAF)
 
@@ -877,7 +877,7 @@ Location: `files/media/`
 
 **UpdateCheck.java:**
 - Runs 5 seconds after launch in background thread
-- Checks `https://api.github.com/repos/MostafaXS1/artcraft-android/releases/latest`
+- Checks `https://api.github.com/repos/10Sumedh01/artcraft-android/releases/latest`
 - Compares baked `BUILDER_VERSION` with latest release tag
 - Shows notification once per version if newer
 - Links to `UPDATE_PAGE_URL`
@@ -1699,7 +1699,7 @@ public class UpdateCheck {
 ```
 
 ### 45.2 API Endpoint
-`https://api.github.com/repos/MostafaXS1/artcraft-android/releases/latest`
+`https://api.github.com/repos/10Sumedh01/artcraft-android/releases/latest`
 Compares tag name with baked BUILDER_VERSION.
 
 ### 45.3 Behavior
@@ -1938,8 +1938,8 @@ adb uninstall com.artcraft.<app>
 - APK names: <app>-<version>.apk
 
 ### 53.4 Quick Reference Links
-- [GitHub Repo](https://github.com/MostafaXS1/artcraft-android)
-- [Releases](https://github.com/MostafaXS1/artcraft-android/releases)
+- [GitHub Repo](https://github.com/10Sumedh01/artcraft-android)
+- [Releases](https://github.com/10Sumedh01/artcraft-android/releases)
 - [ArtCraft Website](https://getartcraft.com/)
 - [Storytold GitHub](https://github.com/storytold)
 

@@ -1,17 +1,31 @@
-# ArtCraft Android
+# ArtCraft Android — Mobile Enhanced Edition
 
 > [!NOTE]
-> **About this project:** We are an independent group of people who love ArtCraft very much and want to make these apps available on Android. We are not affiliated with, related to, or endorsed by ArtCraft / Storytold, and all our ports are completely unofficial.
+> **About this project:** This is an independent, community-driven mobile port of the ArtCraft PC suite for Android, focused on delivering a first-class touchscreen and tablet experience. We are not affiliated with, related to, or endorsed by ArtCraft / Storytold, and all our ports are completely unofficial.
 
-**The full ArtCraft PC experience, now on Android.**
+**The full ArtCraft PC creative suite, reimagined and optimized for Android.**
 
-[**Download the apps**](https://github.com/MostafaXS1/artcraft-android/releases/) · [ArtCraft website](https://getartcraft.com/) · [Explore the apps](https://getartcraft.com/apps)
+[**Download the APKs**](https://github.com/10Sumedh01/artcraft-android/releases/) · [ArtCraft website](https://getartcraft.com/) · [Explore the apps](https://getartcraft.com/apps)
 
 ![ArtCraft Android](artcraft-android-1.png)
 
 ArtCraft Android brings the complete functionality of the ArtCraft PC applications to Android devices. The apps retain their PC capabilities while gaining native Android integrations for file access, touch input, keyboards, mice, trackpads, and other system features.
 
 Whether you're using a phone, tablet, or an Android device with a keyboard and mouse, ArtCraft gives you the same powerful creative tools available on PC, adapted to work naturally with Android.
+
+---
+
+## 🌟 Mobile-First Enhancements (v0.5.0+)
+
+This repository introduces extensive touch and mobile ergonomics improvements over the standard desktop ports:
+
+* **📱 Floating Mobile Accessory Dock:** An unobtrusive, draggable on-screen toolbar providing:
+  * **Virtual Sticky Modifiers:** One-tap toggles for `Ctrl`, `Alt`, `Shift`, and `✋ Space` (canvas pan), enabling multi-selection, proportional scaling, and easy canvas navigation without physical keyboards.
+  * **Long-Press Right Click (~450ms):** Holding a finger stationary automatically triggers secondary clicks and context menus across the interface.
+  * **Quick Zoom Controls:** Dedicated `[🔍+]` and `[🔍-]` buttons for instant, precise canvas zooming.
+  * **Quick Action Keys:** Convenient shortcuts for `Undo`, `Redo`, `Esc`, `Tab`, and `Enter`.
+* **🔒 Soft Keyboard Lock:** Accidental taps on the canvas or screen will no longer pop up the virtual keyboard unexpectedly. Toggle `[🔒 Lock: ON]` to keep the keyboard down, or tap `[⌨ Keyboard]` to explicitly summon it whenever you need to edit text.
+* **🔍 Responsive Pinch-to-Zoom:** Natural two-finger pinch-to-zoom (in and out) with balanced deadzones and midpoint anchor tracking so the canvas zooms smoothly around your fingers without mistaking pinches for scrolling.
 
 ## The Full PC Experience on Android
 
@@ -57,7 +71,7 @@ Connect a keyboard and mouse, use a trackpad, or work directly on a touchscreen.
 These capabilities are implemented through shared Android runtime components, platform compatibility patches, and app-specific adapters.
 
 
-[**Download the latest APKs**](https://github.com/MostafaXS1/artcraft-android/releases/)
+[**Download the latest APKs**](https://github.com/10Sumedh01/artcraft-android/releases/)
 
 ## Built for Android Without Removing PC Functionality
 
@@ -69,10 +83,10 @@ The Android build process uses templates, adapters, vendored changes, and compat
 
 ## Links
 
-- **Downloads:** [GitHub Releases](https://github.com/MostafaXS1/artcraft-android/releases/)
+- **Downloads:** [GitHub Releases](https://github.com/10Sumedh01/artcraft-android/releases/)
 - **ArtCraft website:** [getartcraft.com](https://getartcraft.com/)
 - **Explore the apps:** [getartcraft.com/apps](https://getartcraft.com/apps)
-- **Source code:** [ArtCraft Android repository](https://github.com/MostafaXS1/artcraft-android)
+- **Source code:** [ArtCraft Android Mobile Repository](https://github.com/10Sumedh01/artcraft-android)
 - **Architecture Documentation:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Systems & Mobile Learning Guide:** [`docs/LEARNING_GUIDE.md`](docs/LEARNING_GUIDE.md)
 - **CI/CD Workflow Documentation:** [`docs/ci-workflow.md`](docs/ci-workflow.md)
@@ -192,4 +206,4 @@ We don't have deep domain expertise across all of these diverse tools (DAW music
 * Please download the APKs, try your normal workflows, and tell us:
   * **What works smoothly on PC but is broken, missing, or buggy on Android?**
   * **What needs improvement with touch gestures, tablet layouts, or keyboard/mouse navigation?**
-* If you run into issues, crashes, or quirks, please [open an issue on GitHub](https://github.com/MostafaXS1/artcraft-android/issues) with your device info and reproduction steps. Every piece of feedback helps!
+* If you run into issues, crashes, or quirks, please [open an issue on GitHub](https://github.com/10Sumedh01/artcraft-android/issues) with your device info and reproduction steps. Every piece of feedback helps!
