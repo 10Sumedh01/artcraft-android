@@ -46,6 +46,12 @@ impl MobileOverlay {
         Self::default()
     }
 
+    /// Process raw input each frame (alias for `process_raw_input`).
+    #[inline]
+    pub fn event(&mut self, raw: &mut egui::RawInput) {
+        self.process_raw_input(raw);
+    }
+
     /// Process raw input each frame: applies virtual modifiers, handles right-click translation,
     /// space/pan tool behavior, and drains queued synthetic keys.
     pub fn process_raw_input(&mut self, raw: &mut egui::RawInput) {

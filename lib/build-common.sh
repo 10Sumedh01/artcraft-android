@@ -612,7 +612,7 @@ marker = android_dir / ".artcraft-android-builder-generated"
 # Bump this whenever the generated launcher template changes so stale wrappers (which live in the
 # source checkout and would otherwise be preserved forever) are regenerated automatically instead
 # of failing against a newer app API.
-GENERATOR_VERSION = "62"
+GENERATOR_VERSION = "63"
 
 # A complete adapter supplied by the user wins over auto-detection. This folder is maintained
 # inside the builder, while its contents are copied into this source checkout.
@@ -1562,6 +1562,7 @@ fn saf_services(bridge: saf::Bridge, state: Arc<SafState>, inbox: SafInbox) -> S
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(vec![wordcraft_ui_egui::printing::Printer {
                 name: "Android print system".to_owned(),
+                label: String::new(),
                 default: true,
             }]);
             rx
@@ -2853,7 +2854,10 @@ icon = "@mipmap/ic_launcher"
         inner_logic = "let _ = frame;\n        self.inner.logic(ctx);"
         inner_ui = "let _ = frame;\n        self.inner.ui(ui);"
         if has_raw_hook:
-            inner_hook = "let _ = ctx;\n        self.inner.raw_input_hook(raw);"
+            if re.search(r"pub fn raw_input_hook\s*\(&mut self,\s*_?ctx\s*:", ui_text):
+                inner_hook = "self.inner.raw_input_hook(ctx, raw);"
+            else:
+                inner_hook = "let _ = ctx;\n        self.inner.raw_input_hook(raw);"
         else:
             inner_hook = "let _ = (ctx, raw);"
 
