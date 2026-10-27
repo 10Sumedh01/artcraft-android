@@ -33,11 +33,12 @@ Your existing creative workflow stays available, with Android providing the syst
 
 ArtCraft Android adapts the applications' input handling to Android while preserving their PC functionality.
 
-- **Touch gestures:** Two-finger scrolling and momentum scrolling for navigating large documents and canvases.
+- **Touch gestures:** Smooth two-finger scrolling, momentum scrolling, and responsive pinch-to-zoom (zoom in and out) with midpoint anchor tracking.
+- **Mobile Touch Accessory Bar:** A floating, draggable on-screen dock providing sticky virtual modifiers (`Ctrl`, `Alt`, `Shift`, `Space` pan), long-press right click (~450ms) for context menus, quick zoom buttons (`🔍+`/`🔍-`), and a soft-keyboard lock (`🔒 Lock`) to prevent accidental popups on screen taps.
 - **Mouse support:** Pointer movement, hover events, mouse buttons, and wheel scrolling.
 - **Trackpad support:** Desktop-style navigation and scrolling on compatible devices.
 - **Physical keyboards:** Keyboard shortcuts and modifier keys, including Ctrl, Alt, and Shift.
-- **Android soft keyboard:** Input Method Editor (IME) integration for text entry, composition, deletion, and editor actions.
+- **Android soft keyboard:** Input Method Editor (IME) integration with explicit summon (`⌨ Keyboard`), auto-lock suppression, text entry, composition, deletion, and editor actions.
 - **International text input:** Support for composed text and non-English input through Android's input system.
 - **System clipboard:** Copy, cut, and paste through Android's clipboard, including keyboard shortcuts.
 - **Back-button integration:** Android Back is mapped to the appropriate application behavior where supported by the runtime.
@@ -72,8 +73,10 @@ The Android build process uses templates, adapters, vendored changes, and compat
 - **ArtCraft website:** [getartcraft.com](https://getartcraft.com/)
 - **Explore the apps:** [getartcraft.com/apps](https://getartcraft.com/apps)
 - **Source code:** [ArtCraft Android repository](https://github.com/MostafaXS1/artcraft-android)
+- **Architecture Documentation:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Systems & Mobile Learning Guide:** [`docs/LEARNING_GUIDE.md`](docs/LEARNING_GUIDE.md)
+- **CI/CD Workflow Documentation:** [`docs/ci-workflow.md`](docs/ci-workflow.md)
 - **Adapter documentation:** [`adapters/README.md`](adapters/README.md)
-- **Architecture documentation:** [`architecture.md`](architecture.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 
 ---
