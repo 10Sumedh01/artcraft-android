@@ -118,21 +118,10 @@ pub struct State {
     ///
     /// Creates duplicate touches, if real touch inputs are coming.
     simulate_touch_screen: bool,
-
-    /// Is Some(…) when a touch is being translated to a pointer.
-    ///
-    /// Only one touch will be interpreted as pointer at any time.
     pointer_touch_id: Option<u64>,
-
-    /// Touch ids seen since the current gesture began, used to tell a multi-finger gesture apart
-    /// from a fresh single-finger one. A one-finger drag becomes a mouse drag (selection,
-    /// drag-to-scroll); as soon as a second finger joins, the gesture is multi-touch (two-finger
-    /// scroll, pinch) and must not drive the pointer, or the first finger would keep selecting text
-    /// underneath the scroll. This set is deliberately rebuilt from `Started` events only — never
-    /// pruned by `Ended` — because the platform backend may legitimately stop forwarding a
-    /// gesture's touches once it becomes a scroll, and relying on `Ended` to clean up would leave
-    /// the suppression stuck on and break every later gesture.
     gesture_touch_ids: Vec<u64>,
+    touch_down_info: Option<(u64, winit::dpi::PhysicalPosition<f64>, web_time::Instant)>,
+    touch_long_press_triggered: bool,
 
     #[cfg(feature = "accesskit")]
     pub accesskit: Option<accesskit_winit::Adapter>,
@@ -185,6 +174,8 @@ impl State {
             simulate_touch_screen: false,
             pointer_touch_id: None,
             gesture_touch_ids: Vec::new(),
+            touch_down_info: None,
+            touch_long_press_triggered: false,
 
             #[cfg(feature = "accesskit")]
             accesskit: None,
@@ -279,6 +270,8 @@ impl State {
     /// viewport.
     pub fn take_egui_input(&mut self, window: &Window) -> egui::RawInput {
         profiling::function_scope!();
+
+        self.check_touch_long_press();
 
         self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
 
@@ -594,6 +587,10 @@ impl State {
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
+            WindowEvent::ImeResetCompleted { .. } => EventResponse {
+                repaint: false,
+                consumed: false,
+            },
         }
     }
 
@@ -950,12 +947,21 @@ impl State {
         // gesture. The app is also patched (see the builder) to ignore a press while a gesture is
         // in progress, since this release can only arrive a frame after the press.
         if self.gesture_touch_ids.len() > 1 {
+            self.touch_down_info = None;
             if self.pointer_touch_id.is_some() {
                 self.pointer_touch_id = None;
-                self.on_mouse_button_input(
-                    winit::event::ElementState::Released,
-                    winit::event::MouseButton::Left,
-                );
+                if self.touch_long_press_triggered {
+                    self.touch_long_press_triggered = false;
+                    self.on_mouse_button_input(
+                        winit::event::ElementState::Released,
+                        winit::event::MouseButton::Right,
+                    );
+                } else {
+                    self.on_mouse_button_input(
+                        winit::event::ElementState::Released,
+                        winit::event::MouseButton::Left,
+                    );
+                }
             }
             if self.pointer_pos_in_points.is_some() {
                 self.pointer_pos_in_points = None;
@@ -979,34 +985,71 @@ impl State {
                     if !was_pointer => {}
                 winit::event::TouchPhase::Started => {
                     self.pointer_touch_id = Some(touch.id);
+                    self.touch_down_info = Some((touch.id, touch.location, web_time::Instant::now()));
+                    self.touch_long_press_triggered = false;
                     // First move the pointer to the right location
                     self.on_cursor_moved(window, touch.location);
                     self.on_mouse_button_input(
                         winit::event::ElementState::Pressed,
                         winit::event::MouseButton::Left,
                     );
+                    // Schedule repaint so long-press fires even if the finger stays motionless
+                    self.egui_ctx.request_repaint_after(web_time::Duration::from_millis(480));
                 }
                 winit::event::TouchPhase::Moved => {
+                    if let Some((id, start_pos, start_time)) = self.touch_down_info {
+                        if id == touch.id {
+                            let dx = (touch.location.x - start_pos.x).abs();
+                            let dy = (touch.location.y - start_pos.y).abs();
+                            if dx * dx + dy * dy > 400.0 {
+                                // Moved more than 20 physical pixels: cancel long-press
+                                self.touch_down_info = None;
+                            } else if !self.touch_long_press_triggered
+                                && start_time.elapsed() >= web_time::Duration::from_millis(450)
+                            {
+                                self.touch_long_press_triggered = true;
+                                self.on_mouse_button_input(
+                                    winit::event::ElementState::Released,
+                                    winit::event::MouseButton::Left,
+                                );
+                                self.on_mouse_button_input(
+                                    winit::event::ElementState::Pressed,
+                                    winit::event::MouseButton::Right,
+                                );
+                            }
+                        }
+                    }
                     self.on_cursor_moved(window, touch.location);
                 }
                 winit::event::TouchPhase::Ended => {
+                    self.touch_down_info = None;
                     self.pointer_touch_id = None;
-                    self.on_mouse_button_input(
-                        winit::event::ElementState::Released,
-                        winit::event::MouseButton::Left,
-                    );
+                    if self.touch_long_press_triggered {
+                        self.touch_long_press_triggered = false;
+                        self.on_mouse_button_input(
+                            winit::event::ElementState::Released,
+                            winit::event::MouseButton::Right,
+                        );
+                    } else {
+                        self.on_mouse_button_input(
+                            winit::event::ElementState::Released,
+                            winit::event::MouseButton::Left,
+                        );
+                    }
                     // The pointer should vanish completely to not get any
                     // hover effects
                     self.pointer_pos_in_points = None;
                     self.egui_input.events.push(egui::Event::PointerGone);
                 }
                 winit::event::TouchPhase::Cancelled => {
-                    // The touch was cancelled: the backend took the gesture over (a two-finger
-                    // pan becomes a scroll, a two-finger pinch a zoom). The finger may still be
-                    // on the glass, so the pointer keeps its place — the canvas only takes the
-                    // scroll while the pointer is over it — but the button is released, so the
-                    // gesture does not drag a text selection along with it.
-                    if was_pointer {
+                    self.touch_down_info = None;
+                    if self.touch_long_press_triggered {
+                        self.touch_long_press_triggered = false;
+                        self.on_mouse_button_input(
+                            winit::event::ElementState::Released,
+                            winit::event::MouseButton::Right,
+                        );
+                    } else if was_pointer {
                         self.on_mouse_button_input(
                             winit::event::ElementState::Released,
                             winit::event::MouseButton::Left,
@@ -1014,6 +1057,27 @@ impl State {
                     }
                     self.pointer_touch_id = None;
                 }
+            }
+        }
+    }
+
+    /// Check if a stationary single touch has exceeded the long-press duration (~450ms).
+    /// If so, seamlessly converts the initial primary press into a secondary (right) click
+    /// so context menus appear on mobile without a mouse.
+    fn check_touch_long_press(&mut self) {
+        if let Some((_id, _start_pos, start_time)) = self.touch_down_info {
+            if !self.touch_long_press_triggered
+                && start_time.elapsed() >= web_time::Duration::from_millis(450)
+            {
+                self.touch_long_press_triggered = true;
+                self.on_mouse_button_input(
+                    winit::event::ElementState::Released,
+                    winit::event::MouseButton::Left,
+                );
+                self.on_mouse_button_input(
+                    winit::event::ElementState::Pressed,
+                    winit::event::MouseButton::Right,
+                );
             }
         }
     }
@@ -2442,5 +2506,6 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
         WindowEvent::ThemeChanged { .. } => "WindowEvent::ThemeChanged",
         WindowEvent::Occluded { .. } => "WindowEvent::Occluded",
         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+        WindowEvent::ImeResetCompleted { .. } => "WindowEvent::ImeResetCompleted",
     }
 }

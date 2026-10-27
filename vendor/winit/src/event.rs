@@ -248,6 +248,9 @@ pub enum WindowEvent {
     /// - **iOS / Android / Web / Orbital:** Unsupported.
     Ime(Ime),
 
+    /// The ordered cancellation fence requested by [`Window::reset_ime_with_request`].
+    ImeResetCompleted { request_id: u64 },
+
     /// The cursor has moved on the window.
     ///
     /// ## Platform-specific

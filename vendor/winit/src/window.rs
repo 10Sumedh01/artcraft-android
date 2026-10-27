@@ -1319,6 +1319,24 @@ impl Window {
             .maybe_queue_on_main(move |w| w.set_ime_purpose(purpose))
     }
 
+    /// Resets the current composition, discarding active preedit.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **iOS / Android / Web / Orbital:** Unsupported.
+    #[inline]
+    pub fn reset_ime(&self) {
+        let _span = tracing::debug_span!("winit::Window::reset_ime").entered();
+        self.window.maybe_queue_on_main(|w| w.reset_ime())
+    }
+
+    /// Resets composition like [`Self::reset_ime`] and queues an ordered completion fence.
+    #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        let _span = tracing::debug_span!("winit::Window::reset_ime_with_request").entered();
+        self.window.maybe_queue_on_main(move |w| w.reset_ime_with_request(request_id))
+    }
+
     /// Brings the window to the front and sets input focus. Has no effect if the window is
     /// already in focus, minimized, or not visible.
     ///

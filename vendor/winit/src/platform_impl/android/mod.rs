@@ -56,16 +56,16 @@ const POINTS_PER_AXIS: f64 = 40.0;
 
 /// How far the two fingers' midpoint must move (physical pixels) before a two-finger gesture
 /// counts as a pan (a scroll) rather than staying undecided.
-const PAN_DEADZONE_PX: f64 = 12.0;
+const PAN_DEADZONE_PX: f64 = 14.0;
 
 /// How far the two fingers' spread must change (physical pixels) before a two-finger gesture can
 /// be a pinch (a zoom) rather than a pan.
-const PINCH_DEADZONE_PX: f64 = 36.0;
+const PINCH_DEADZONE_PX: f64 = 14.0;
 
 /// How much more the two fingers' spread must change than their midpoint moves for a pinch to win
-/// the gesture. A pan holds the fingers a fixed distance apart while the pair slides; a pinch
-/// mostly changes the distance. Well above 1, so a slightly uneven drag still scrolls.
-const PINCH_SPREAD_RATIO: f64 = 1.5;
+/// the gesture. A ratio around 0.8 allows a standard one-finger-anchored pinch (where spread = 2 * moved)
+/// to be recognized promptly instead of mistaking it for a scroll.
+const PINCH_SPREAD_RATIO: f64 = 0.75;
 
 /// How much faster a two-finger pan scrolls than the fingers move.
 const PAN_SPEED: f64 = 1.5;
@@ -364,11 +364,7 @@ impl<T: 'static> EventLoop<T> {
         trace!("Mainloop iteration");
 
         let cause = self.cause;
-        let mut pending_redraw = self.pending_redraw
-            || matches!(
-                cause,
-                StartCause::Init | StartCause::Poll | StartCause::ResumeTimeReached { .. }
-            );
+        let mut pending_redraw = self.pending_redraw;
         let mut resized = false;
 
         callback(event::Event::NewEvents(cause), self.window_target());
@@ -609,29 +605,35 @@ impl<T: 'static> EventLoop<T> {
 
                 match self.gesture {
                     Gesture::Undecided => {
-                        // A pinch changes the spread much more than the midpoint moves; that is a
-                        // zoom, not a scroll. Until one of the two is clearly bigger, the
-                        // gesture stays undecided and nothing is reported: that is the
-                        // deadzone between scrolling and zooming.
+                        // A pinch changes the spread significantly; a pan moves the midpoint.
+                        // Whichever exceeds its deadzone and dominates the movement wins.
                         if spread_change > PINCH_DEADZONE_PX
-                            && spread_change > PINCH_SPREAD_RATIO * moved
+                            && spread_change >= PINCH_SPREAD_RATIO * moved
                         {
                             self.gesture = Gesture::Pinch;
-                        } else if moved > PAN_DEADZONE_PX {
+                            self.gesture_spread = Some(spread);
+                        } else if moved > PAN_DEADZONE_PX && moved >= spread_change * 0.75 {
                             self.gesture = Gesture::Pan;
                         } else {
                             return GestureStep::None;
                         }
                     }
                     Gesture::Pan => {
-                        // A pan that turns into a clear pinch hands over to the zoom, but only
-                        // once the spread has changed twice as much as the deadzone: a gesture
-                        // that has already started scrolling does not flip on a twitch.
-                        if spread_change > 2.0 * PINCH_DEADZONE_PX {
+                        // A pan that turns into a clear pinch hands over to zoom when the spread change
+                        // clearly outpaces the pan motion.
+                        if spread_change > PINCH_DEADZONE_PX * 1.5 && spread_change >= moved * 0.8 {
                             self.gesture = Gesture::Pinch;
+                            self.gesture_spread = Some(spread);
+                            self.gesture_origin = Some((spread, midpoint));
                         }
                     }
-                    Gesture::Pinch => {}
+                    Gesture::Pinch => {
+                        // A pinch that turns into a clear slide hands over to pan.
+                        if moved > PAN_DEADZONE_PX * 2.0 && moved >= spread_change * 1.5 {
+                            self.gesture = Gesture::Pan;
+                            self.gesture_origin = Some((spread, midpoint));
+                        }
+                    }
                 }
 
                 match self.gesture {
@@ -639,7 +641,7 @@ impl<T: 'static> EventLoop<T> {
                         // The zoom is relative to the last step, so a pinch that starts at the
                         // deadzone's edge does not jump: the spread change that got us here is
                         // the deadzone's, and the zoom starts from where the fingers are now.
-                        let last = self.gesture_spread.replace(new_spread).unwrap_or(new_spread);
+                        let last = self.gesture_spread.replace(new_spread).unwrap_or(spread);
                         let factor = if last > 0.0 { new_spread / last } else { 1.0 };
                         GestureStep::Pinch(factor)
                     }
@@ -1089,6 +1091,18 @@ impl<T: 'static> EventLoop<T> {
                         match self.recognise_touch_gesture(motion_event) {
                             GestureStep::Pan(delta) => {
                                 trace!("Two-finger scroll {device_id:?} {delta:?}");
+                                if let Some(position) = self.touch_midpoint() {
+                                    callback(
+                                        event::Event::WindowEvent {
+                                            window_id,
+                                            event: event::WindowEvent::CursorMoved {
+                                                device_id,
+                                                position,
+                                            },
+                                        },
+                                        self.window_target(),
+                                    );
+                                }
                                 callback(
                                     event::Event::WindowEvent {
                                         window_id,
@@ -1104,6 +1118,18 @@ impl<T: 'static> EventLoop<T> {
                             }
                             GestureStep::Pinch(factor) => {
                                 trace!("Two-finger pinch {device_id:?} {factor:?}");
+                                if let Some(position) = self.touch_midpoint() {
+                                    callback(
+                                        event::Event::WindowEvent {
+                                            window_id,
+                                            event: event::WindowEvent::CursorMoved {
+                                                device_id,
+                                                position,
+                                            },
+                                        },
+                                        self.window_target(),
+                                    );
+                                }
                                 callback(
                                     event::Event::WindowEvent {
                                         window_id,
@@ -1722,6 +1748,11 @@ impl Window {
     }
 
     pub fn set_ime_purpose(&self, _purpose: ImePurpose) {}
+
+    pub fn reset_ime(&self) {}
+
+    #[inline]
+    pub fn reset_ime_with_request(&self, _request_id: u64) {}
 
     pub fn focus_window(&self) {}
 

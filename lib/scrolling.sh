@@ -127,6 +127,18 @@ if app == "wordcraft":
     ):
         fixed.append("crates/ui-egui/src/canvas.rs (two-finger press does not select)")
 
+    # Responsive pinch zoom on Android
+    if fix(
+        "crates/ui-egui/src/canvas.rs",
+        "    let mut zoom_anchor = None;\n"
+        "    if (zoom_delta - 1.0).abs() > 1e-3 && ui.rect_contains_pointer(area) {\n",
+        "    let mut zoom_anchor = None;\n"
+        "    let has_zoom = (zoom_delta - 1.0).abs() > 1e-4;\n"
+        "    let contains_pointer = ui.rect_contains_pointer(area) || (cfg!(target_os = \"android\") && has_zoom);\n"
+        "    if has_zoom && contains_pointer {\n",
+    ):
+        fixed.append("crates/ui-egui/src/canvas.rs (responsive pinch zoom)")
+
     # A second finger arriving after the press already started a drag: drop it, so the scroll
     # never carries a selection along. Runs before the drag-extension arms below.
     if fix(
@@ -366,6 +378,13 @@ if app == "wordcraft":
         "            request_ime_hide: false,\n",
     ):
         fixed.append("crates/ui-egui/src/lib.rs (the keyboard-hide request, at rest)")
+
+    if fix(
+        "crates/ui-egui/src/window_ui.rs",
+        "            shown_document,\n        } = self;\n",
+        "            shown_document,\n            request_ime_hide: _,\n        } = self;\n",
+    ):
+        fixed.append("crates/ui-egui/src/window_ui.rs (the keyboard-hide request)")
 
     # The flick's coast. The upstream constant leaves the momentum to the platform on the
     # platforms that send their own: macOS and Windows (they report the lift, and a touchpad
